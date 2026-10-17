@@ -4,11 +4,13 @@ datasources:
     uid: footprint
     type: grafana-postgresql-datasource
     url: db:5432
-    user: fp
+    user: grafana_ro          # только чтение; создаётся в grafana.sh
     isDefault: true
+    editable: false
     jsonData:
       database: footprint
       sslmode: disable
       timescaledb: false
+      maxOpenConns: 5
     secureJsonData:
-      password: $PG_PASSWORD
+      password: $GRAFANA_DB_PASSWORD
