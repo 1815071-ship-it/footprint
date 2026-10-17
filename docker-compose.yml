@@ -1,0 +1,58 @@
+# Footprint: сбор сделок с бирж -> Postgres -> Grafana.
+# Отдельный проект, мост Upscale (/root/bridge) не трогает.
+name: footprint
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: footprint
+      POSTGRES_USER: fp
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+    command: ["postgres", "-c", "shared_buffers=128MB", "-c", "work_mem=8MB", "-c", "max_connections=20"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fp -d footprint"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    logging: &logs
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+  collector:
+    build: ./collector
+    restart: unless-stopped
+    environment:
+      PG_DSN: postgresql://fp:${PG_PASSWORD}@db:5432/footprint
+      BIG_USD: "100000"
+    depends_on:
+      db: {condition: service_healthy}
+    mem_limit: 512m
+    logging: *logs
+
+  # Grafana включается на шаге 5: docker compose --profile ui up -d
+  grafana:
+    image: grafana/grafana:12.0.0
+    profiles: ["ui"]
+    restart: unless-stopped
+    environment:
+      PG_PASSWORD: ${PG_PASSWORD}
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - grafana:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      db: {condition: service_healthy}
+    mem_limit: 384m
+    logging: *logs
+
+volumes:
+  pgdata:
+  grafana:
