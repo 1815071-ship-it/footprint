@@ -65,6 +65,36 @@ ON CONFLICT (exchange, market, symbol) DO UPDATE SET
     trades = EXCLUDED.trades, started = EXCLUDED.started
 """
 
+# Минутные свечи по каждому потоку. Таблица создаётся здесь, а не в schema.sql:
+# schema.sql выполняется только при самом первом запуске базы, а база уже работает.
+OHLC_DDL = """
+CREATE TABLE IF NOT EXISTS ohlc_1m (
+    ts        timestamptz      NOT NULL,  -- начало минуты, UTC
+    exchange  text             NOT NULL,
+    market    text             NOT NULL,
+    symbol    text             NOT NULL,
+    open_ts   bigint           NOT NULL,  -- время первой сделки минуты, мс (чтобы склеивать записи)
+    open      double precision NOT NULL,
+    high      double precision NOT NULL,
+    low       double precision NOT NULL,
+    close_ts  bigint           NOT NULL,  -- время последней сделки минуты, мс
+    close     double precision NOT NULL,
+    PRIMARY KEY (symbol, ts, exchange, market)
+)
+"""
+# В SET все ohlc_1m.* - это старые значения строки, поэтому порядок присваиваний не важен.
+UPSERT_OHLC = """
+INSERT INTO ohlc_1m (ts, exchange, market, symbol, open_ts, open, high, low, close_ts, close)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+ON CONFLICT (symbol, ts, exchange, market) DO UPDATE SET
+    open     = CASE WHEN EXCLUDED.open_ts < ohlc_1m.open_ts THEN EXCLUDED.open ELSE ohlc_1m.open END,
+    open_ts  = LEAST(ohlc_1m.open_ts, EXCLUDED.open_ts),
+    high     = GREATEST(ohlc_1m.high, EXCLUDED.high),
+    low      = LEAST(ohlc_1m.low, EXCLUDED.low),
+    close    = CASE WHEN EXCLUDED.close_ts >= ohlc_1m.close_ts THEN EXCLUDED.close ELSE ohlc_1m.close END,
+    close_ts = GREATEST(ohlc_1m.close_ts, EXCLUDED.close_ts)
+"""
+
 
 def utc(ms):
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
@@ -74,11 +104,26 @@ def new_cells():
     return collections.defaultdict(lambda: [0.0, 0.0, 0, 0])
 
 
+def merge_ohlc(store, key, v):
+    """Склеивает свечу v = [open_ts, open, high, low, close_ts, close] с уже накопленной."""
+    cur = store.get(key)
+    if cur is None:
+        store[key] = list(v)
+        return
+    if v[0] < cur[0]:
+        cur[0], cur[1] = v[0], v[1]
+    cur[2] = max(cur[2], v[2])
+    cur[3] = min(cur[3], v[3])
+    if v[4] >= cur[4]:
+        cur[4], cur[5] = v[4], v[5]
+
+
 class Agg:
     """Накопитель между записями в базу."""
 
     def __init__(self):
         self.cells = new_cells()
+        self.ohlc = {}          # (минута, биржа, рынок, монета) -> [open_ts, open, high, low, close_ts, close]
         self.big = []
         self.hb = {}            # (биржа, рынок, монета) -> [последняя сделка ms, сделок всего]
         self.minute_trades = collections.Counter()
@@ -95,6 +140,7 @@ class Agg:
         else:
             cell[1] += qty
             cell[3] += 1
+        merge_ohlc(self.ohlc, (minute, exchange, market, sym), [ts, price, price, price, ts, price])
         usd = price * qty
         if usd >= BIG_USD:
             self.big.append((utc(ts), exchange, market, sym, side, price, qty, usd, tid))
@@ -103,12 +149,14 @@ class Agg:
         hb[1] += 1
         self.minute_trades[(exchange, market, sym)] += 1
 
-    def merge_back(self, cells, big):
+    def merge_back(self, cells, big, ohlc):
         """Если запись в базу не удалась, возвращаем данные в накопитель."""
         for k, v in cells.items():
             c = self.cells[k]
             for i in range(4):
                 c[i] += v[i]
+        for k, v in ohlc.items():
+            merge_ohlc(self.ohlc, k, v)
         self.big = big + self.big
 
 
@@ -159,23 +207,27 @@ async def stream(ex, lock, cls, exchange, market, sym, csym, agg):
 
 async def flush(pool, agg):
     cells, agg.cells = agg.cells, new_cells()
+    ohlc, agg.ohlc = agg.ohlc, {}
     big, agg.big = agg.big, []
     hb = [(e, m, s, utc(v[0]), v[1], agg.started) for (e, m, s), v in agg.hb.items()]
     if not cells and not big and not hb:
         return 0
     rows = [(utc(k[0]), k[1], k[2], k[3], k[4], v[0], v[1], v[2], v[3]) for k, v in cells.items()]
+    candles = [(utc(k[0]), k[1], k[2], k[3], *v) for k, v in ohlc.items()]
     try:
         async with pool.acquire() as con:
             async with con.transaction():
                 if rows:
                     await con.executemany(UPSERT_CELLS, rows)
+                if candles:
+                    await con.executemany(UPSERT_OHLC, candles)
                 if big:
                     await con.executemany(INSERT_BIG, big)
                 if hb:
                     await con.executemany(UPSERT_HB, hb)
     except Exception as e:  # noqa: BLE001
         log.error("db write failed: %s; keeping %d cells in memory", e, len(cells))
-        agg.merge_back(cells, big)
+        agg.merge_back(cells, big, ohlc)
         return 0
     return len(rows)
 
@@ -201,7 +253,10 @@ async def connect_db():
     delay = 2
     while True:
         try:
-            return await asyncpg.create_pool(dsn, min_size=1, max_size=2)
+            pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2)
+            async with pool.acquire() as con:
+                await con.execute(OHLC_DDL)
+            return pool
         except Exception as e:  # noqa: BLE001
             log.warning("db not ready: %s; retry in %ds", e, delay)
             await asyncio.sleep(delay)

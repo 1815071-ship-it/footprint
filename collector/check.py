@@ -91,10 +91,14 @@ def tape(trades):
     return buy, oldest, newest - 60
 
 
+BINANCE_OHLC = {}  # (рынок, монета) -> {минута: (open, high, low, close)} из свечей Binance, для сверки свечей
+
+
 def ref_binance(market, sym, now, need_from):
     base = "https://api.binance.com/api/v3" if market == "spot" else "https://fapi.binance.com/fapi/v1"
     rows = get(f"{base}/klines?symbol={sym}USDT&interval=1m&limit=60")
     # свеча: [время открытия мс, open, high, low, close, объём, ..., taker buy в монетах (индекс 9), ...]
+    BINANCE_OHLC[(market, sym)] = {int(k[0]) // 1000: tuple(float(x) for x in k[1:5]) for k in rows}
     vol, frm, to = candles((int(k[0]) // 1000, float(k[5])) for k in rows)
     buy, _, _ = candles((int(k[0]) // 1000, float(k[9])) for k in rows)
     return vol, frm, to, buy, frm, to
@@ -218,6 +222,38 @@ async def main():
             verdict = "ОШИБКА" if not ok else ("OK" if b else "OK, только объём")
             bcol = f"{b[0]:>16}{b[3]:>8.2f}" if b else f"{'лента коротка':>16}{'-':>8}"
             print(f"{name:<18}{v[0]:>6}{v[1]:>13.3f}{v[2]:>13.3f}{v[3]:>8.2f}{bcol}  {verdict}")
+    # Свечи: наши open/high/low/close по Binance против официальных свечей Binance, минута в минуту.
+    print("\nсвечи (open, high, low, close) против свечей Binance:")
+    hi = minute(now - 70)
+    for market in ("spot", "perp"):
+        for sym in SYMBOLS:
+            name = f"binance {market} {sym}"
+            ref = BINANCE_OHLC.get((market, sym))
+            if ref is None:
+                print(f"  {name:<18} свечи Binance не получены")
+                unchecked.append(name + " свечи")
+                continue
+            try:
+                ours = await con.fetch(
+                    "SELECT ts, open, high, low, close FROM ohlc_1m "
+                    "WHERE exchange = 'binance' AND market = $1 AND symbol = $2 AND ts > $3", market, sym, start_dt)
+            except asyncpg.exceptions.UndefinedTableError:
+                print(f"  {name:<18} таблицы ohlc_1m ещё нет (коллектор старой версии)")
+                unchecked.append(name + " свечи")
+                continue
+            ours = {int(r["ts"].timestamp()): (r["open"], r["high"], r["low"], r["close"]) for r in ours}
+            mins = [m for m in ref if start < m <= hi]
+            same = [m for m in mins if m in ours and all(abs(a - b) <= 1e-9 * b for a, b in zip(ours[m], ref[m]))]
+            if not mins:
+                print(f"  {name:<18} пока нет полных минут")
+                unchecked.append(name + " свечи")
+                continue
+            ok = len(same) == len(mins)
+            ok_all &= ok
+            first = next((m for m in sorted(mins) if m not in same), None)
+            diff = "" if ok else (f"  первая разница {datetime.fromtimestamp(first, tz=timezone.utc):%H:%M}: "
+                                  f"наша {ours.get(first)}, биржа {ref[first]}")
+            print(f"  {name:<18} совпало {len(same)} из {len(mins)} минут  {'OK' if ok else 'ОШИБКА'}{diff}")
     hb = await con.fetch(
         "SELECT exchange, market, symbol, trades, round(extract(epoch FROM now() - last_trade)) AS ago "
         "FROM heartbeat ORDER BY 1, 2, 3")
