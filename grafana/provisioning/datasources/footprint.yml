@@ -1,0 +1,14 @@
+apiVersion: 1
+datasources:
+  - name: Footprint
+    uid: footprint
+    type: grafana-postgresql-datasource
+    url: db:5432
+    user: fp
+    isDefault: true
+    jsonData:
+      database: footprint
+      sslmode: disable
+      timescaledb: false
+    secureJsonData:
+      password: $PG_PASSWORD
