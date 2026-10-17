@@ -44,6 +44,13 @@ def get(url):
         return json.load(resp)
 
 
+def get_h(url):
+    """GET -> (json, заголовки). Нужен для постраничной ленты Coinbase (заголовок cb-after)."""
+    req = urllib.request.Request(url, headers={"User-Agent": "footprint-check/1.0"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.load(resp), resp.headers
+
+
 def minute(ts_sec):
     return int(ts_sec) // 60 * 60
 
@@ -160,9 +167,29 @@ def ref_coinbase(market, sym, now, need_from):
     # start/end задаём явно: без них сервер однажды отдал устаревший ответ
     span = f"start={utc_iso(minute(now) - 290 * 60)}&end={utc_iso(minute(now) + 60)}"
     vol, frm, to = candles((int(r[0]), float(r[5])) for r in get(f"{p}/candles?granularity=60&{span}"))
-    # лента: side = сторона мейкера, поэтому "sell" значит, что агрессор купил. Максимум 1000 сделок
-    buy, bfrm, bto = tape((iso_ms(t["time"]), float(t["size"]), t["side"] == "sell")
-                          for t in get(f"{p}/trades?limit=1000"))
+    # лента: side = сторона мейкера, поэтому "sell" значит, что агрессор купил. По 1000 сделок на страницу,
+    # листаем назад по заголовку cb-after до ~35 минут истории (не больше 10 страниц)
+    target = min(need_from, minute(now) - 35 * 60)
+    trades, after = [], None
+    for _ in range(10):
+        page, headers = get_h(f"{p}/trades?limit=1000" + (f"&after={after}" if after else ""))
+        if not page:
+            break
+        trades += page
+        after = headers.get("cb-after")
+        if not after or minute(iso_ms(page[-1]["time"]) / 1000) <= target:
+            break
+    rows = [(iso_ms(t["time"]), float(t["size"]), t["side"] == "sell") for t in trades]
+    buy, bfrm, bto = tape(rows)
+    # Объём за минуты, которые лента покрывает целиком, берём из ленты, а не из свечей: свечи Coinbase бывают
+    # неполными. 17.10 свеча ETH за 14:50 показала 9.29 ETH, а лента сделок биржи (и наша база) - 23.16 ETH.
+    tvol, tfrm, tto = tape((t, q, True) for t, q, _ in rows)
+    if tfrm is not None:
+        for m in list(vol):
+            if tfrm < m <= tto:
+                vol[m] = tvol.get(m, 0.0)
+        for m, v in tvol.items():
+            vol.setdefault(m, v)
     return vol, frm, to, buy, bfrm, bto
 
 

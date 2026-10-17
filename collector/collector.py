@@ -157,6 +157,7 @@ class Agg:
         self.blackouts = collections.Counter()  # (биржа, рынок, монета) -> сколько раз молчали все копии сразу
         self.dark = set()       # потоки, у которых сейчас молчат все копии (чтобы считать каждый случай один раз)
         self.stream_seen = {}   # (биржа, рынок, монета) -> monotonic-время последней пачки сделок по любой копии
+        self.class_reset = {}   # класс ccxt -> monotonic-время последнего переподключения любой его копии
         self.seen = {}          # (биржа, рынок, монета) -> (очередь, множество) последних номеров сделок
         self.dupes = collections.Counter()  # (биржа, рынок, монета) -> повторов за минуту (сделка пришла по обеим копиям)
 
@@ -343,11 +344,20 @@ async def watchdog(exchanges, agg, stop):
             else:
                 agg.dark.discard(skey)
         for cls, copies in exchanges.items():
+            # копии этой биржи, где молчит хоть один поток; первой переподключаем ту, что молчит дольше
+            order = []
             for replica, ex in enumerate(copies):
-                silent = [f"{k[2]} {k[3]} {k[4]} {now - agg.seen_at[k]:.0f}s" for k in silent_keys
-                          if k[0] == cls and k[1] == replica]
-                if not silent:
+                keys = [k for k in silent_keys if k[0] == cls and k[1] == replica]
+                if keys:
+                    order.append((max(now - agg.seen_at[k] for k in keys), replica, ex, keys))
+            for _, replica, ex, keys in sorted(order, key=lambda o: -o[0]):
+                # Не переподключаем все копии биржи разом: 17.10 в 15:03 сторож уронил обе копии Bybit из-за
+                # затишья в одном потоке (spot BTC), и на переподключении потерялись сделки активных потоков.
+                # Следующую копию той же биржи трогаем не раньше чем через STALL_SEC - одна остаётся на связи.
+                if len(copies) > 1 and now - agg.class_reset.get(cls, -1e9) < STALL_SEC:
                     continue
+                agg.class_reset[cls] = now
+                silent = [f"{k[2]} {k[3]} {k[4]} {now - agg.seen_at[k]:.0f}s" for k in keys]
                 agg.resets[(cls, replica)] += 1
                 clients = list(getattr(ex, "clients", {}).values())
                 log.warning("watchdog: %s#%d silent (%s); force reconnect #%d, %d ws connection(s)",
