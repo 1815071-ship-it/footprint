@@ -35,23 +35,46 @@ services:
     mem_limit: 512m
     logging: *logs
 
-  # Grafana включается на шаге 5: docker compose --profile ui up -d
+  # Grafana (шаг 5). Запуск и обновление: bash grafana.sh
+  # Снаружи доступна через Caddy моста: https://andrey-bridge.duckdns.org/fp/ (порт на сервере не открывает).
   grafana:
-    image: grafana/grafana:12.0.0
+    image: grafana/grafana:12.4.12          # 12.0.x уязвима (CVE-2026-27876), 12.4.12 - с исправлениями
     profiles: ["ui"]
     restart: unless-stopped
     environment:
-      PG_PASSWORD: ${PG_PASSWORD}
+      GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD}   # read-only пользователь базы, см. grafana.sh
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_SERVER_ROOT_URL: https://andrey-bridge.duckdns.org/fp/
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_SECURITY_COOKIE_SECURE: "true"
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_AUTH_BASIC_ENABLED: "false"         # вход только через форму, без логина/пароля в API-запросах
       GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_PLUGINS_PREINSTALL: volkovlabs-echarts-panel@7.2.5
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/provisioning/dashboards/footprint.json
     volumes:
       - grafana:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
-    ports:
-      - "127.0.0.1:3000:3000"
+    networks:
+      default: {}
+      edge:
+        aliases: [footprint-grafana]       # по этому имени Grafana находит Caddy моста
     depends_on:
       db: {condition: service_healthy}
     mem_limit: 384m
     logging: *logs
+
+networks:
+  # Сеть моста Upscale: в неё подключена только Grafana, чтобы Caddy моста мог отдать её наружу.
+  edge:
+    external: true
+    name: bridge_default
 
 volumes:
   pgdata:

@@ -11,8 +11,12 @@ main() {
   echo "файлы целы (sha256 сходится)"
   docker compose build collector
   docker compose up -d db collector
+  # если Grafana уже запущена - применяем её настройки (дашборд из файла она подхватывает сама)
+  if [ -n "$(docker compose --profile ui ps -q grafana)" ]; then
+    docker compose --profile ui up -d grafana
+  fi
   sleep 5
-  docker compose ps
+  docker compose --profile ui ps
 }
 
 main "$@"
