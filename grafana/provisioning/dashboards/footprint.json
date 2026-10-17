@@ -1,0 +1,365 @@
+{
+  "uid": "footprint",
+  "title": "Footprint · кластеры",
+  "tags": [
+    "footprint"
+  ],
+  "timezone": "utc",
+  "editable": true,
+  "graphTooltip": 0,
+  "refresh": "10s",
+  "time": {
+    "from": "now-3h",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "5s",
+      "10s",
+      "30s",
+      "1m",
+      "5m"
+    ]
+  },
+  "schemaVersion": 39,
+  "templating": {
+    "list": [
+      {
+        "type": "custom",
+        "name": "symbol",
+        "label": "Монета",
+        "hide": 0,
+        "query": "BTC : BTC,ETH : ETH",
+        "current": {
+          "text": "BTC",
+          "value": "BTC",
+          "selected": true
+        },
+        "options": [
+          {
+            "text": "BTC",
+            "value": "BTC",
+            "selected": true
+          },
+          {
+            "text": "ETH",
+            "value": "ETH",
+            "selected": false
+          }
+        ],
+        "multi": false,
+        "includeAll": false,
+        "skipUrlSync": false
+      },
+      {
+        "type": "custom",
+        "name": "market",
+        "label": "Рынок",
+        "hide": 0,
+        "query": "spot + perp : all,spot : spot,perp : perp",
+        "current": {
+          "text": "spot + perp",
+          "value": "all",
+          "selected": true
+        },
+        "options": [
+          {
+            "text": "spot + perp",
+            "value": "all",
+            "selected": true
+          },
+          {
+            "text": "spot",
+            "value": "spot",
+            "selected": false
+          },
+          {
+            "text": "perp",
+            "value": "perp",
+            "selected": false
+          }
+        ],
+        "multi": false,
+        "includeAll": false,
+        "skipUrlSync": false
+      },
+      {
+        "type": "custom",
+        "name": "exchange",
+        "label": "Биржа",
+        "hide": 0,
+        "query": "все : all,Binance : binance,Bybit : bybit,OKX : okx,Coinbase : coinbase",
+        "current": {
+          "text": "все",
+          "value": "all",
+          "selected": true
+        },
+        "options": [
+          {
+            "text": "все",
+            "value": "all",
+            "selected": true
+          },
+          {
+            "text": "Binance",
+            "value": "binance",
+            "selected": false
+          },
+          {
+            "text": "Bybit",
+            "value": "bybit",
+            "selected": false
+          },
+          {
+            "text": "OKX",
+            "value": "okx",
+            "selected": false
+          },
+          {
+            "text": "Coinbase",
+            "value": "coinbase",
+            "selected": false
+          }
+        ],
+        "multi": false,
+        "includeAll": false,
+        "skipUrlSync": false
+      },
+      {
+        "type": "custom",
+        "name": "tf",
+        "label": "Таймфрейм",
+        "hide": 0,
+        "query": "1m : 1 minute,5m : 5 minutes,15m : 15 minutes,1h : 1 hour,4h : 4 hours",
+        "current": {
+          "text": "15m",
+          "value": "15 minutes",
+          "selected": true
+        },
+        "options": [
+          {
+            "text": "1m",
+            "value": "1 minute",
+            "selected": false
+          },
+          {
+            "text": "5m",
+            "value": "5 minutes",
+            "selected": false
+          },
+          {
+            "text": "15m",
+            "value": "15 minutes",
+            "selected": true
+          },
+          {
+            "text": "1h",
+            "value": "1 hour",
+            "selected": false
+          },
+          {
+            "text": "4h",
+            "value": "4 hours",
+            "selected": false
+          }
+        ],
+        "multi": false,
+        "includeAll": false,
+        "skipUrlSync": false
+      },
+      {
+        "type": "custom",
+        "name": "step",
+        "label": "Шаг цены, $",
+        "hide": 0,
+        "query": "1 : 1,2 : 2,5 : 5,10 : 10,25 : 25,50 : 50,100 : 100,250 : 250,500 : 500",
+        "current": {
+          "text": "50",
+          "value": "50",
+          "selected": true
+        },
+        "options": [
+          {
+            "text": "1",
+            "value": "1",
+            "selected": false
+          },
+          {
+            "text": "2",
+            "value": "2",
+            "selected": false
+          },
+          {
+            "text": "5",
+            "value": "5",
+            "selected": false
+          },
+          {
+            "text": "10",
+            "value": "10",
+            "selected": false
+          },
+          {
+            "text": "25",
+            "value": "25",
+            "selected": false
+          },
+          {
+            "text": "50",
+            "value": "50",
+            "selected": true
+          },
+          {
+            "text": "100",
+            "value": "100",
+            "selected": false
+          },
+          {
+            "text": "250",
+            "value": "250",
+            "selected": false
+          },
+          {
+            "text": "500",
+            "value": "500",
+            "selected": false
+          }
+        ],
+        "multi": false,
+        "includeAll": false,
+        "skipUrlSync": false
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "volkovlabs-echarts-panel",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "footprint"
+      },
+      "title": "$symbol · footprint · Sell | Buy | Delta (в монетах), свечи: Binance perp для «все»",
+      "gridPos": {
+        "h": 27,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "footprint"
+          },
+          "rawQuery": true,
+          "editorMode": "code",
+          "format": "table",
+          "rawSql": "SELECT\n  date_bin('$tf'::interval, ts, TIMESTAMPTZ '2001-01-01') AS time,\n  floor(price / $step) * $step                       AS level,\n  sum(sell_vol)                                      AS sell,\n  sum(buy_vol)                                       AS buy\nFROM fp_1m\nWHERE $__timeFilter(ts)\n  AND symbol = '$symbol'\n  AND ('$market' = 'all' OR market = '$market')\n  AND ('$exchange' = 'all' OR exchange = '$exchange')\nGROUP BY 1, 2\nORDER BY 1, 2"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "footprint"
+          },
+          "rawQuery": true,
+          "editorMode": "code",
+          "format": "table",
+          "rawSql": "SELECT\n  date_bin('$tf'::interval, ts, TIMESTAMPTZ '2001-01-01') AS time,\n  (array_agg(open  ORDER BY open_ts))[1]             AS open,\n  max(high)                                          AS high,\n  min(low)                                           AS low,\n  (array_agg(close ORDER BY close_ts DESC))[1]       AS close\nFROM ohlc_1m\nWHERE $__timeFilter(ts)\n  AND symbol = '$symbol'\n  AND exchange = CASE WHEN '$exchange' = 'all' THEN 'binance' ELSE '$exchange' END\n  AND market = CASE WHEN '$exchange' = 'coinbase' THEN 'spot'\n                    WHEN '$market' = 'all' THEN 'perp' ELSE '$market' END\nGROUP BY 1\nORDER BY 1"
+        }
+      ],
+      "options": {
+        "renderer": "canvas",
+        "editorMode": "code",
+        "getOption": "// Footprint-кластеры для панели Business Charts (Apache ECharts) в Grafana.\n// Этот файл - исходник. В дашборд он попадает через build_dashboard.py (поле options.getOption).\n//\n// Данные приходят двумя запросами:\n//   A - кластеры: time (начало бара), level (нижняя граница уровня цены), sell, buy (объём в монетах)\n//   B - свечи:    time, open, high, low, close\n// На каждый бар рисуем слот: свеча слева, дальше три колонки по уровням цены:\n//   Sell (агрессивные продажи) | Buy (агрессивные покупки) | Delta = Buy - Sell с полосой.\n// Рамкой выделен уровень с максимальным объёмом в баре (POC).\n\nconst theme = context.grafana.theme;\nconst dark = theme.isDark;\nconst TEXT = theme.colors.text.primary;\nconst MUTED = theme.colors.text.secondary;\nconst GRID = dark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)';\nconst RED = dark ? '#ff5c5c' : '#d93025';\nconst GREEN = dark ? '#3ddc84' : '#188038';\nconst RED_BAR = dark ? 'rgba(255,92,92,0.55)' : 'rgba(217,48,37,0.45)';\nconst GREEN_BAR = dark ? 'rgba(61,220,132,0.55)' : 'rgba(24,128,56,0.45)';\nconst POC = dark ? 'rgba(255,214,10,0.9)' : 'rgba(176,128,0,0.9)';\n\nconst v = (name) => context.grafana.replaceVariables(name);\nconst step = Number(v('$step')) || 50;\nconst sym = v('$symbol');\nconst frames = context.panel.data.series || [];\nconst frame = (ref) => frames.find((f) => f.refId === ref);\nconst col = (f, name) => {\n  const fld = f && f.fields.find((x) => x.name === name);\n  return fld ? Array.from(fld.values) : [];\n};\n\nconst A = frame('A');\nconst B = frame('B');\nconst at = col(A, 'time'), lv = col(A, 'level'), sl = col(A, 'sell'), by = col(A, 'buy');\nconst bt = col(B, 'time'), bo = col(B, 'open'), bh = col(B, 'high'), bl = col(B, 'low'), bc = col(B, 'close');\n\n// Слоты = бары по времени. Слот i занимает по оси X отрезок [i, i+1).\nconst times = Array.from(new Set([...at, ...bt])).sort((a, b) => a - b);\nconst slotOf = new Map(times.map((t, i) => [t, i]));\nconst n = times.length;\n\nconst pad = (x) => String(x).padStart(2, '0');\nconst label = (ms) => {\n  const d = new Date(ms);\n  return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;\n};\nconst fmt = (x) => {\n  const a = Math.abs(x);\n  if (a >= 10000) return (x / 1000).toFixed(1) + 'k';\n  if (a >= 100) return x.toFixed(0);\n  if (a >= 10) return x.toFixed(1);\n  return x.toFixed(2);\n};\n\n// Ячейки: [слот, уровень, sell, buy, delta]. Плюс максимумы по слоту для масштаба полос и POC.\nconst cells = [];\nconst maxDelta = new Array(n).fill(0);\nconst pocVol = new Array(n).fill(-1);\nconst pocLevel = new Array(n).fill(null);\nfor (let i = 0; i < at.length; i++) {\n  const s = slotOf.get(at[i]);\n  const sell = sl[i] || 0, buy = by[i] || 0, d = buy - sell;\n  cells.push([s, lv[i], sell, buy, d]);\n  maxDelta[s] = Math.max(maxDelta[s], Math.abs(d));\n  if (sell + buy > pocVol[s]) {\n    pocVol[s] = sell + buy;\n    pocLevel[s] = lv[i];\n  }\n}\nconst candles = bt.map((t, i) => [slotOf.get(t), bo[i], bh[i], bl[i], bc[i]]);\n\n// Окно просмотра: при обновлении данных сохраняем масштаб; если смотрели последние бары - едем за ними.\nconst chart = context.panel.chart || null;\nconst key = [sym, v('$tf'), step, v('$market'), v('$exchange')].join('|');\nconst perSlot = 190;\nconst width = chart && chart.getWidth ? chart.getWidth() : 1400;\nconst fit = Math.max(3, Math.floor((width - 80) / perSlot));\nlet startValue = Math.max(0, n - fit), endValue = n;\nconst prev = chart && chart.__fp;\nif (prev && prev.key === key && chart.getOption) {\n  const z = ((chart.getOption() || {}).dataZoom || [])[0];\n  if (z && z.startValue != null && z.endValue != null) {\n    const width = z.endValue - z.startValue;\n    if (z.endValue >= prev.n - 0.5) {\n      endValue = n;\n      startValue = Math.max(0, n - width);\n    } else {\n      startValue = z.startValue;\n      endValue = z.endValue;\n    }\n  }\n}\nif (chart) chart.__fp = { key, n };\n\nconst clusterSeries = {\n  type: 'custom',\n  name: 'clusters',\n  data: cells,\n  encode: { x: 0, y: 1 },\n  clip: true,\n  renderItem: (params, api) => {\n    const s = api.value(0), level = api.value(1), sell = api.value(2), buy = api.value(3), d = api.value(4);\n    const top = api.coord([s, level + step])[1];\n    const bot = api.coord([s, level])[1];\n    const h = Math.abs(bot - top);\n    const x0 = api.coord([s, level])[0];\n    const w = api.size([1, 0])[0];\n    const kids = [];\n    // полоса дельты: длина относительно максимальной дельты в этом баре\n    const bw = maxDelta[s] > 0 ? (Math.abs(d) / maxDelta[s]) * w * 0.3 : 0;\n    kids.push({\n      type: 'rect',\n      shape: { x: x0 + w * 0.66, y: top + h * 0.1, width: Math.max(bw, 1), height: h * 0.8 },\n      style: { fill: d >= 0 ? GREEN_BAR : RED_BAR },\n    });\n    if (pocLevel[s] === level) {\n      kids.push({\n        type: 'rect',\n        shape: { x: x0 + w * 0.17, y: top + 0.5, width: w * 0.47, height: Math.max(h - 1, 1) },\n        style: { fill: 'none', stroke: POC, lineWidth: 1 },\n      });\n    }\n    // цифры рисуем, только когда ячейка достаточно высокая и бар достаточно широкий\n    if (h >= 8 && w >= 110) {\n      const fs = Math.max(8, Math.min(12, Math.floor(h * 0.75)));\n      const yMid = top + h / 2;\n      const txt = (x, value, color, align, bold) => ({\n        type: 'text',\n        style: {\n          x, y: yMid, text: fmt(value), fill: color, align, verticalAlign: 'middle',\n          font: `${bold ? '600 ' : ''}${fs}px sans-serif`,\n        },\n      });\n      kids.push(txt(x0 + w * 0.39, sell, RED, 'right'));\n      kids.push(txt(x0 + w * 0.62, buy, GREEN, 'right'));\n      kids.push(txt(x0 + w * 0.67, d, TEXT, 'left', true));\n    }\n    return { type: 'group', children: kids };\n  },\n};\n\nconst candleSeries = {\n  type: 'custom',\n  name: 'candles',\n  data: candles,\n  encode: { x: 0, y: [1, 2, 3, 4] },\n  clip: true,\n  z: 3,\n  renderItem: (params, api) => {\n    const s = api.value(0), o = api.value(1), hi = api.value(2), lo = api.value(3), c = api.value(4);\n    const w = api.size([1, 0])[0];\n    const x0 = api.coord([s, o])[0];\n    const xc = x0 + w * 0.085;\n    const yo = api.coord([s, o])[1], yc = api.coord([s, c])[1];\n    const yh = api.coord([s, hi])[1], yl = api.coord([s, lo])[1];\n    const color = c >= o ? GREEN : RED;\n    return {\n      type: 'group',\n      children: [\n        { type: 'line', shape: { x1: xc, y1: yh, x2: xc, y2: yl }, style: { stroke: color, lineWidth: 1 } },\n        {\n          type: 'rect',\n          shape: { x: x0 + w * 0.03, y: Math.min(yo, yc), width: w * 0.11, height: Math.max(Math.abs(yc - yo), 1) },\n          style: { fill: color },\n        },\n      ],\n    };\n  },\n};\n\nreturn {\n  backgroundColor: 'transparent',\n  animation: false,\n  grid: { left: 8, right: 72, top: 10, bottom: 46 },\n  tooltip: {\n    trigger: 'item',\n    confine: true,\n    formatter: (p) => {\n      const d = p.data;\n      const when = label(times[d[0]]);\n      if (p.seriesName === 'candles') {\n        return `${when} UTC<br/>open ${d[1]}<br/>high ${d[2]}<br/>low ${d[3]}<br/>close ${d[4]}`;\n      }\n      return `${when} UTC · $${d[1]}–${d[1] + step}<br/>` +\n        `<span style=\"color:${RED}\">Sell ${fmt(d[2])} ${sym}</span><br/>` +\n        `<span style=\"color:${GREEN}\">Buy ${fmt(d[3])} ${sym}</span><br/>` +\n        `<b>Delta ${fmt(d[4])} ${sym}</b>`;\n    },\n  },\n  xAxis: {\n    type: 'value',\n    min: 0,\n    max: n,\n    interval: 1,\n    axisLine: { lineStyle: { color: GRID } },\n    axisTick: { show: false },\n    splitLine: { show: true, lineStyle: { color: GRID } },\n    axisLabel: { color: MUTED, formatter: (x) => (Number.isInteger(x) && x < n ? label(times[x]) : '') },\n  },\n  yAxis: {\n    type: 'value',\n    position: 'right',\n    scale: true,\n    max: (e) => Math.ceil(e.max / step) * step + step,\n    min: (e) => Math.floor(e.min / step) * step,\n    splitLine: { show: true, lineStyle: { color: GRID } },\n    axisLabel: { color: MUTED, formatter: (x) => '$' + x },\n  },\n  dataZoom: [\n    { type: 'inside', xAxisIndex: 0, filterMode: 'weakFilter', startValue, endValue, minValueSpan: 1 },\n    {\n      type: 'slider', xAxisIndex: 0, filterMode: 'weakFilter', startValue, endValue, height: 14, bottom: 6,\n      showDetail: false, borderColor: GRID, textStyle: { color: MUTED },\n    },\n    { type: 'inside', yAxisIndex: 0, filterMode: 'none', zoomOnMouseWheel: 'shift', moveOnMouseMove: 'shift' },\n  ],\n  series: [clusterSeries, candleSeries],\n};\n",
+        "editor": {
+          "format": "auto",
+          "height": 600
+        },
+        "followTheme": false,
+        "themeEditor": {
+          "name": "default",
+          "config": "{}"
+        },
+        "map": "none"
+      }
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "footprint"
+      },
+      "title": "Пульс потоков",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 27
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "footprint"
+          },
+          "rawQuery": true,
+          "editorMode": "code",
+          "format": "table",
+          "rawSql": "SELECT exchange AS \"биржа\", market AS \"рынок\", symbol AS \"монета\",\n       round(extract(epoch FROM now() - last_trade)) AS \"сек с последней сделки\",\n       trades AS \"сделок с запуска\"\nFROM heartbeat\nORDER BY 1, 2, 3"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "left"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "сек с последней сделки"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 30
+                    },
+                    {
+                      "color": "red",
+                      "value": 120
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      }
+    }
+  ]
+}
