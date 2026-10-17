@@ -320,7 +320,8 @@ async def snap_one(pool, st, key):
         st.fail[key] += 1
         st.last_err[key] = msg
         return
-    if exchange == "binance" and headers.get("x-mbx-used-weight-1m", "").isdigit():
+    # вес считаем только по spot: у фьючерсов Binance свой счётчик и свой лимит
+    if exchange == "binance" and market == "spot" and headers.get("x-mbx-used-weight-1m", "").isdigit():
         st.binance_weight = (int(headers["x-mbx-used-weight-1m"]), time.monotonic())
     now = time.time()
     snap = bucketize(bids, asks, sym, LIMIT[(exchange, market)])

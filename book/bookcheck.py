@@ -106,13 +106,19 @@ async def main():
               f"{r['diff']:>8.1f}{r['walls']:>9}  {r['verdict']}")
         if r["verdict"] != "OK":
             bad.append(name)
-    hour = await con.fetchval("SELECT count(*) FROM book_1m WHERE ts >= now() - interval '1 hour'")
+    # Прогноз на сутки: строки за последний час (или с первой записи, если сборщик работает меньше часа)
+    # делим на фактически покрытые минуты. Текущую неполную минуту не считаем.
+    hour, first, last = await con.fetchrow(
+        "SELECT count(*), min(ts), max(ts) FROM book_1m "
+        "WHERE ts >= date_trunc('minute', now()) - interval '60 minutes' AND ts < date_trunc('minute', now())")
     total = await con.fetchval("SELECT count(*) FROM book_1m")
     size = await con.fetchval("SELECT pg_total_relation_size('book_1m') + pg_total_relation_size('book_meta_1m')")
     per_row = size / total if total else 0
-    print(f"\nbook_1m: {total} строк, {size / 2**20:.0f} МБ вместе с book_meta_1m; за последний час {hour} строк, "
-          f"в сутки ~{hour * 24 / 1e6:.1f} млн строк ~{hour * 24 * per_row / 2**20:.0f} МБ. "
-          f"Время сервера: {datetime.now(timezone.utc):%H:%M:%S} UTC")
+    mins = (last - first).total_seconds() / 60 + 1 if first else 0
+    per_day = hour / mins * 1440 if mins else 0
+    print(f"\nbook_1m: {total} строк, {size / 2**20:.0f} МБ вместе с book_meta_1m. "
+          f"За последние {mins:.0f} полных минут {hour} строк: в сутки ~{per_day / 1e6:.1f} млн строк "
+          f"~{per_day * per_row / 2**20:.0f} МБ. Время сервера: {datetime.now(timezone.utc):%H:%M:%S} UTC")
     print("ИТОГ по стакану: " + ("всё сходится" if not bad else "проверить: " + ", ".join(bad)))
     await con.close()
 
