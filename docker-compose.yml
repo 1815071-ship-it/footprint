@@ -30,6 +30,9 @@ services:
     environment:
       PG_DSN: postgresql://fp:${PG_PASSWORD}@db:5432/footprint
       BIG_USD: "100000"
+      # Сторож: поток молчит дольше max(STALL_SEC, 8 средних интервалов) - переподключаем биржу.
+      # 17.10 при 90 с потери сделок доходили до 19% (Binance spot ETH зависал 8 раз в час).
+      STALL_SEC: "20"
     depends_on:
       db: {condition: service_healthy}
     mem_limit: 512m
