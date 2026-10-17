@@ -49,7 +49,13 @@ def minute(ts_sec):
 
 
 def pct(a, b):
-    return 0.0 if b == 0 else (a - b) / b * 100
+    if b == 0:
+        return 0.0 if a == 0 else 100.0  # у биржи пусто, а у нас есть объём - это расхождение
+    return (a - b) / b * 100
+
+
+def utc_iso(ts_sec):
+    return f"{datetime.fromtimestamp(ts_sec, tz=timezone.utc):%Y-%m-%dT%H:%M:%SZ}"
 
 
 def iso_ms(s):
@@ -60,35 +66,38 @@ def iso_ms(s):
 
 
 def candles(rows):
-    """Свечи [(минута, объём)] -> ({минута: объём}, нижняя граница покрытия)."""
+    """Свечи [(минута, объём)] -> ({минута: объём}, покрыто от (не включая), покрыто до (включая)).
+    Самую свежую свечу не считаем полной: биржа могла отдать её посреди минуты."""
     vol = {}
     for m, v in rows:
         vol[m] = vol.get(m, 0.0) + v
-    return vol, (min(vol) - 60) if vol else None
+    if not vol:
+        return {}, None, None
+    return vol, min(vol) - 60, max(vol) - 60
 
 
 def tape(trades):
-    """Лента [(время мс, количество, агрессор купил)] -> ({минута: покупки}, нижняя граница покрытия).
-    Самую старую минуту ленты не считаем: лента могла начаться с её середины."""
+    """Лента [(время мс, количество, агрессор купил)] -> ({минута: покупки}, покрыто от, покрыто до).
+    Крайние минуты ленты не считаем: лента могла начаться и закончиться посреди минуты."""
     trades = list(trades)
     if not trades:
-        return {}, None
-    oldest = min(minute(t / 1000) for t, _, _ in trades)
+        return {}, None, None
+    mins = [minute(t / 1000) for t, _, _ in trades]
+    oldest, newest = min(mins), max(mins)
     buy = {}
-    for t, qty, is_buy in trades:
-        m = minute(t / 1000)
-        if m > oldest and is_buy:
+    for (t, qty, is_buy), m in zip(trades, mins):
+        if oldest < m < newest and is_buy:
             buy[m] = buy.get(m, 0.0) + qty
-    return buy, oldest
+    return buy, oldest, newest - 60
 
 
-def ref_binance(market, sym):
+def ref_binance(market, sym, now, need_from):
     base = "https://api.binance.com/api/v3" if market == "spot" else "https://fapi.binance.com/fapi/v1"
     rows = get(f"{base}/klines?symbol={sym}USDT&interval=1m&limit=60")
     # свеча: [время открытия мс, open, high, low, close, объём, ..., taker buy в монетах (индекс 9), ...]
-    vol, vol_from = candles((int(k[0]) // 1000, float(k[5])) for k in rows)
-    buy, _ = candles((int(k[0]) // 1000, float(k[9])) for k in rows)
-    return vol, vol_from, buy, vol_from
+    vol, frm, to = candles((int(k[0]) // 1000, float(k[5])) for k in rows)
+    buy, _, _ = candles((int(k[0]) // 1000, float(k[9])) for k in rows)
+    return vol, frm, to, buy, frm, to
 
 
 def bybit(path):
@@ -98,16 +107,16 @@ def bybit(path):
     return j["result"]["list"]
 
 
-def ref_bybit(market, sym):
+def ref_bybit(market, sym, now, need_from):
     cat = "spot" if market == "spot" else "linear"
     # свеча: [время открытия мс, open, high, low, close, объём в монетах, оборот в USDT]
-    vol, vol_from = candles((int(r[0]) // 1000, float(r[5]))
-                            for r in bybit(f"kline?category={cat}&symbol={sym}USDT&interval=1&limit=60"))
+    vol, frm, to = candles((int(r[0]) // 1000, float(r[5]))
+                           for r in bybit(f"kline?category={cat}&symbol={sym}USDT&interval=1&limit=60"))
     # лента: side = сторона агрессора. spot отдаёт максимум 60 последних сделок, linear - 1000
     lim = 60 if cat == "spot" else 1000
-    buy, buy_from = tape((int(t["time"]), float(t["size"]), t["side"] == "Buy")
-                         for t in bybit(f"recent-trade?category={cat}&symbol={sym}USDT&limit={lim}"))
-    return vol, vol_from, buy, buy_from
+    buy, bfrm, bto = tape((int(t["time"]), float(t["size"]), t["side"] == "Buy")
+                          for t in bybit(f"recent-trade?category={cat}&symbol={sym}USDT&limit={lim}"))
+    return vol, frm, to, buy, bfrm, bto
 
 
 def okx(path):
@@ -117,45 +126,56 @@ def okx(path):
     return j["data"]
 
 
-def ref_okx(market, sym):
+def ref_okx(market, sym, now, need_from):
     inst = f"{sym}-USDT" if market == "spot" else f"{sym}-USDT-SWAP"
     # свеча: [время мс, o, h, l, c, vol, volCcy, volCcyQuote, confirm].
     # spot: vol - объём в монетах. swap: vol - в контрактах, volCcy - в монетах
     col = 5 if market == "spot" else 6
-    vol, vol_from = candles((int(r[0]) // 1000, float(r[col]))
-                            for r in okx(f"market/candles?instId={inst}&bar=1m&limit=60"))
+    vol, frm, to = candles((int(r[0]) // 1000, float(r[col]))
+                           for r in okx(f"market/candles?instId={inst}&bar=1m&limit=60"))
     ct = 1.0  # в ленте перпа количество в контрактах, переводим в монеты
     if market == "perp":
         ct = float(okx(f"public/instruments?instType=SWAP&instId={inst}")[0]["ctVal"])
-    # лента: side = сторона агрессора, максимум 500 последних сделок
-    buy, buy_from = tape((int(t["ts"]), float(t["sz"]) * ct, t["side"] == "buy")
-                         for t in okx(f"market/trades?instId={inst}&limit=500"))
-    return vol, vol_from, buy, buy_from
+    # лента: side = сторона агрессора. 500 последних сделок, дальше листаем историю по 100,
+    # пока не дойдём до нужной минуты (не больше 10 страниц)
+    rows = okx(f"market/trades?instId={inst}&limit=500")
+    for _ in range(10):
+        if not rows or minute(int(rows[-1]["ts"]) / 1000) <= need_from:
+            break
+        page = okx(f"market/history-trades?instId={inst}&limit=100&after={rows[-1]['tradeId']}")
+        if not page:
+            break
+        rows += page
+    buy, bfrm, bto = tape((int(t["ts"]), float(t["sz"]) * ct, t["side"] == "buy") for t in rows)
+    return vol, frm, to, buy, bfrm, bto
 
 
-def ref_coinbase(market, sym):
+def ref_coinbase(market, sym, now, need_from):
     p = f"https://api.exchange.coinbase.com/products/{sym}-USD"
-    # свеча: [время открытия с, low, high, open, close, объём в монетах]; минуты без сделок пропущены
-    vol, vol_from = candles((int(r[0]), float(r[5])) for r in get(f"{p}/candles?granularity=60"))
+    # свеча: [время открытия с, low, high, open, close, объём в монетах]; минуты без сделок пропущены.
+    # start/end задаём явно: без них сервер однажды отдал устаревший ответ
+    span = f"start={utc_iso(minute(now) - 290 * 60)}&end={utc_iso(minute(now) + 60)}"
+    vol, frm, to = candles((int(r[0]), float(r[5])) for r in get(f"{p}/candles?granularity=60&{span}"))
     # лента: side = сторона мейкера, поэтому "sell" значит, что агрессор купил. Максимум 1000 сделок
-    buy, buy_from = tape((iso_ms(t["time"]), float(t["size"]), t["side"] == "sell")
-                         for t in get(f"{p}/trades?limit=1000"))
-    return vol, vol_from, buy, buy_from
+    buy, bfrm, bto = tape((iso_ms(t["time"]), float(t["size"]), t["side"] == "sell")
+                          for t in get(f"{p}/trades?limit=1000"))
+    return vol, frm, to, buy, bfrm, bto
 
 
 REF = {"binance": ref_binance, "bybit": ref_bybit, "okx": ref_okx, "coinbase": ref_coinbase}
 
 
-def compare(ours, ref, ref_from, start, hi):
-    """Суммы за полные минуты start < m <= hi, покрытые биржей: (минут, наше, биржа, разн.%) или None."""
+def compare(ours, ref, ref_from, ref_to, start, hi):
+    """Суммы за полные минуты после старта (start < m <= hi), которые биржа покрыла целиком
+    (ref_from < m <= ref_to): (минут, наше, биржа, разн.%) или None, если таких минут нет."""
     if ref_from is None:
         return None
-    lo = max(start, ref_from)
-    n = (hi - lo) // 60
+    lo, top = max(start, ref_from), min(hi, ref_to)
+    n = (top - lo) // 60
     if n <= 0:
         return None
-    o = sum(v for m, v in ours.items() if lo < m <= hi)
-    r = sum(v for m, v in ref.items() if lo < m <= hi)
+    o = sum(v for m, v in ours.items() if lo < m <= top)
+    r = sum(v for m, v in ref.items() if lo < m <= top)
     return n, o, r, pct(o, r)
 
 
@@ -181,15 +201,16 @@ async def main():
             our_vol = {int(r["ts"].timestamp()): r["vol"] for r in rows}
             our_buy = {int(r["ts"].timestamp()): r["buy"] for r in rows}
             try:
-                vol, vol_from, buy, buy_from = REF[exchange](market, sym)
+                vol, frm, to, buy, bfrm, bto = REF[exchange](market, sym, now, max(start, hi - 5 * 60))
             except Exception as e:  # noqa: BLE001
                 print(f"{name:<18} биржа не ответила: {str(e)[:90]}")
                 unchecked.append(name)
                 continue
-            v = compare(our_vol, vol, vol_from, start, hi)
-            b = compare(our_buy, buy, buy_from, start, hi)
+            v = compare(our_vol, vol, frm, to, start, hi)
+            b = compare(our_buy, buy, bfrm, bto, start, hi)
             if v is None:
-                print(f"{name:<18} пока нет полных минут, подожди 2-3 минуты")
+                why = "пока нет полных минут, подожди 2-3 минуты" if hi <= start else "биржа не отдала свежих свечей"
+                print(f"{name:<18} {why}")
                 unchecked.append(name)
                 continue
             ok = abs(v[3]) < TOL_PCT and (b is None or abs(b[3]) < TOL_PCT)
