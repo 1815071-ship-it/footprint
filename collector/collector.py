@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 
 import asyncpg
 import ccxt.pro as ccxtpro
+from ccxt.base.errors import NetworkError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("fp")
@@ -23,6 +24,11 @@ STEP = {"BTC": 10.0, "ETH": 1.0}            # шаг уровня цены
 BIG_USD = float(os.getenv("BIG_USD", "100000"))  # порог крупной сделки
 FLUSH_SEC = 2.0
 STATS_SEC = 60.0
+# Сторож: если поток молчит дольше порога, закрываем соединения этой биржи - стримы переподключатся.
+# Порог = max(STALL_SEC, 8 средних интервалов между сделками потока), но не больше 600 с,
+# чтобы тихие потоки (OKX spot ETH ночью) не дёргали переподключение зря.
+STALL_SEC = float(os.getenv("STALL_SEC", "90"))
+WATCH_SEC = 5.0
 
 # (биржа, рынок, класс ccxt, {монета: символ ccxt})
 VENUES = [
@@ -105,7 +111,9 @@ def new_cells():
 
 
 def merge_ohlc(store, key, v):
-    """Склеивает свечу v = [open_ts, open, high, low, close_ts, close] с уже накопленной."""
+    """Склеивает свечу v = [open_key, open, high, low, close_key, close] с уже накопленной.
+    open_key/close_key = (время мс, номер сделки): при одинаковой миллисекунде порядок решает номер сделки,
+    как у биржи (рыночный ордер, прошедший несколько уровней, даёт несколько сделок в одну мс)."""
     cur = store.get(key)
     if cur is None:
         store[key] = list(v)
@@ -118,6 +126,11 @@ def merge_ohlc(store, key, v):
         cur[4], cur[5] = v[4], v[5]
 
 
+def trade_order(ts, tid):
+    """Ключ порядка сделки: время, затем номер сделки, если он числовой."""
+    return (ts, int(tid) if tid and tid.isdigit() else 0)
+
+
 class Agg:
     """Накопитель между записями в базу."""
 
@@ -128,6 +141,8 @@ class Agg:
         self.hb = {}            # (биржа, рынок, монета) -> [последняя сделка ms, сделок всего]
         self.minute_trades = collections.Counter()
         self.started = datetime.now(timezone.utc)
+        self.seen_at = {}       # (класс ccxt, биржа, рынок, монета) -> monotonic-время последней пачки сделок
+        self.resets = collections.Counter()  # класс ccxt -> сколько раз сторож переподключал биржу
 
     def add(self, exchange, market, sym, ts, price, qty, side, tid):
         minute = ts // 60000 * 60000
@@ -140,7 +155,8 @@ class Agg:
         else:
             cell[1] += qty
             cell[3] += 1
-        merge_ohlc(self.ohlc, (minute, exchange, market, sym), [ts, price, price, price, ts, price])
+        order = trade_order(ts, tid)
+        merge_ohlc(self.ohlc, (minute, exchange, market, sym), [order, price, price, price, order, price])
         usd = price * qty
         if usd >= BIG_USD:
             self.big.append((utc(ts), exchange, market, sym, side, price, qty, usd, tid))
@@ -178,17 +194,28 @@ async def stream(ex, lock, cls, exchange, market, sym, csym, agg):
     m = ex.market(csym)
     contract_size = float(m.get("contractSize") or 1) if m.get("contract") else 1.0
     log.info("start %s %s %s (%s, contractSize=%s)", exchange, market, sym, csym, contract_size)
+    key = (cls, exchange, market, sym)
+    agg.seen_at[key] = time.monotonic()
     seen, seen_set = collections.deque(), set()
     backoff = 1
     while True:
         try:
             trades = await ex.watch_trades(csym)
             backoff = 1
+        except asyncio.CancelledError:
+            # ccxt при закрытии соединения отменяет свои ожидания - это не остановка коллектора
+            if asyncio.current_task().cancelling():
+                raise
+            log.warning("%s %s %s: wait cancelled by ccxt; reconnect in %ds", exchange, market, sym, backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+            continue
         except Exception as e:  # noqa: BLE001
             log.warning("%s %s %s: %s; reconnect in %ds", exchange, market, sym, str(e)[:200], backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
             continue
+        agg.seen_at[key] = time.monotonic()
         for t in trades:
             tid = t.get("id")
             if tid is not None:
@@ -213,7 +240,7 @@ async def flush(pool, agg):
     if not cells and not big and not hb:
         return 0
     rows = [(utc(k[0]), k[1], k[2], k[3], k[4], v[0], v[1], v[2], v[3]) for k, v in cells.items()]
-    candles = [(utc(k[0]), k[1], k[2], k[3], *v) for k, v in ohlc.items()]
+    candles = [(utc(k[0]), k[1], k[2], k[3], v[0][0], v[1], v[2], v[3], v[4][0], v[5]) for k, v in ohlc.items()]
     try:
         async with pool.acquire() as con:
             async with con.transaction():
@@ -243,9 +270,49 @@ async def flusher(pool, agg, stop):
         if time.monotonic() - last_stats >= STATS_SEC:
             rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
             per = " ".join(f"{e}/{m}/{s}={n}" for (e, m, s), n in sorted(agg.minute_trades.items()))
-            log.info("stats: rows written %d, peak RSS %d MB, trades/min: %s", written, rss, per or "none")
+            resets = " ".join(f"{c}={n}" for c, n in sorted(agg.resets.items())) or "0"
+            log.info("stats: rows written %d, peak RSS %d MB, watchdog resets: %s, trades/min: %s",
+                     written, rss, resets, per or "none")
             agg.minute_trades.clear()
             written, last_stats = 0, time.monotonic()
+
+
+def stall_limit(agg, key, elapsed):
+    """Сколько секунд тишины терпим для потока: 8 средних интервалов между сделками, от STALL_SEC до 600 с."""
+    total = agg.hb.get(key[1:], [0, 0])[1]
+    avg = elapsed / total if total else STALL_SEC / 4
+    return min(600.0, max(STALL_SEC, 8 * avg))
+
+
+async def watchdog(exchanges, agg, stop):
+    """Сторож потоков. Вебсокет биржи иногда замолкает без ошибки (так 17.10 встал Binance spot),
+    и ожидание сделок висит вечно. Если поток молчит дольше порога, роняем соединения этой биржи
+    так же, как это делает сама ccxt при пропущенном ping-pong: client.on_error(...).
+    Ожидающие стримы получают NetworkError и переподключаются по своему обычному циклу."""
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=WATCH_SEC)
+        except asyncio.TimeoutError:
+            pass
+        now = time.monotonic()
+        elapsed = (datetime.now(timezone.utc) - agg.started).total_seconds()
+        for cls, ex in exchanges.items():
+            silent = [f"{k[1]} {k[2]} {k[3]} {now - t:.0f}s" for k, t in agg.seen_at.items()
+                      if k[0] == cls and now - t > stall_limit(agg, k, elapsed)]
+            if not silent:
+                continue
+            agg.resets[cls] += 1
+            clients = list(getattr(ex, "clients", {}).values())
+            log.warning("watchdog: %s silent (%s); force reconnect #%d, %d ws connection(s)",
+                        cls, ", ".join(silent), agg.resets[cls], len(clients))
+            for k in agg.seen_at:
+                if k[0] == cls:
+                    agg.seen_at[k] = now  # даём время переподключиться
+            for client in clients:
+                try:
+                    client.on_error(NetworkError(f"watchdog: no trades ({', '.join(silent)})"))
+                except Exception as e:  # noqa: BLE001
+                    log.warning("watchdog: %s on_error failed: %s", cls, str(e)[:200])
 
 
 async def connect_db():
@@ -278,7 +345,9 @@ async def main():
             locks[cls] = asyncio.Lock()
         for sym, csym in syms.items():
             tasks.append(asyncio.create_task(stream(exchanges[cls], locks[cls], cls, exchange, market, sym, csym, agg)))
-    log.info("collector started: %d streams, flush every %ss, big trade >= $%d", len(tasks), FLUSH_SEC, BIG_USD)
+    tasks.append(asyncio.create_task(watchdog(exchanges, agg, stop)))
+    log.info("collector started: %d streams, flush every %ss, big trade >= $%d, stall limit >= %ds",
+             len(tasks) - 1, FLUSH_SEC, BIG_USD, STALL_SEC)
 
     await flusher(pool, agg, stop)  # работает до SIGTERM
     log.info("stopping: final flush")
