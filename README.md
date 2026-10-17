@@ -6,7 +6,7 @@
 
 Команды (на сервере, из любой папки):
 
-- `bash /opt/footprint/check.sh` — сверка с официальными свечами Binance и пульс всех бирж.
+- `bash /opt/footprint/check.sh` — сверка всех 14 потоков с официальными данными бирж: объём по минутным свечам, покупки по свечам Binance и по ленте сделок Bybit, OKX, Coinbase. Плюс пульс потоков.
 - `bash /opt/footprint/logs.sh` — лог коллектора: раз в минуту строка `stats` со сделками в минуту по каждому потоку.
 - `bash /opt/footprint/update.sh` — скачать свежий код из этого репозитория, проверить sha256 и перезапустить коллектор.
 - `cd /opt/footprint && docker compose restart collector` — перезапуск сборщика.
