@@ -1,4 +1,4 @@
-# Footprint: сбор сделок с бирж -> Postgres -> Grafana.
+# Footprint: сделки и стакан с бирж -> Postgres -> Grafana.
 # Отдельный проект, мост Upscale (/root/bridge) не трогает.
 name: footprint
 
@@ -33,6 +33,21 @@ services:
     depends_on:
       db: {condition: service_healthy}
     mem_limit: 512m
+    logging: *logs
+
+  # Стакан: снимки книги заявок Binance, Bybit, OKX раз в 15 с (REST, глубже вебсокета).
+  # Первый запуск: bash book.sh. Сборщик сделок при этом не перезапускается.
+  book:
+    build: ./book
+    restart: unless-stopped
+    environment:
+      PG_DSN: postgresql://fp:${PG_PASSWORD}@db:5432/footprint
+      BOOK_SEC: "15"            # снимок каждого стакана раз в N секунд
+      BOOK_RANGE_PCT: "3"       # уровни в пределах ±3% от цены
+      BOOK_KEEP_DAYS: "7"       # хранить 7 дней, старое удаляется раз в час
+    depends_on:
+      db: {condition: service_healthy}
+    mem_limit: 160m
     logging: *logs
 
   # Grafana (шаг 5). Запуск и обновление: bash grafana.sh
