@@ -1,0 +1,16 @@
+# Домен DuckDNS -> 2.31.6.34 (сервер Hetzner bridge). Caddy сам получит и продлит HTTPS-сертификат.
+# Наружу открыты только /webhook и /health — остальное (сканеры) получает 404 прямо от Caddy.
+# /fp/ — Grafana проекта footprint (/opt/footprint), вход по паролю Grafana. Добавлено caddy_route.sh.
+andrey-bridge.duckdns.org {
+    @app path /webhook /health
+    handle @app {
+        reverse_proxy bridge:8080
+    }
+    redir /fp /fp/
+    handle /fp/* {
+        reverse_proxy footprint-grafana:3000
+    }
+    handle {
+        respond 404
+    }
+}
