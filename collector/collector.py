@@ -50,7 +50,10 @@ VENUES = [
 
 # Грузим только нужные типы рынков, чтобы не съесть память справочниками бирж.
 EX_OPTIONS = {
-    "binance": {"fetchMarkets": {"types": ["spot"]}},
+    # Binance spot тоже на aggTrade (сделки одного ордера по одной цене склеены): в потоке trade рыночный ордер,
+    # сметающий стакан, даёт сотни сообщений разом, кэш ccxt (1000 сделок) переполняется раньше, чем мы их заберём,
+    # и часть сделок теряется. 17.10 так терялось ~12% объёма Binance spot ETH, в основном продажи.
+    "binance": {"fetchMarkets": {"types": ["spot"]}, "watchTrades": {"name": "aggTrade"}},
     "binanceusdm": {"fetchMarkets": {"types": ["linear"]}, "watchTrades": {"name": "aggTrade"}},
     "bybit": {"fetchMarkets": {"types": ["spot", "linear"]}},
     "okx": {"fetchMarkets": {"types": ["spot", "swap"]}},
