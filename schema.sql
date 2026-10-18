@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS fp_1m (
     PRIMARY KEY (symbol, ts, exchange, market, price)
 );
 
--- Крупные сделки (одна сделка >= $100k) для слоя Large Trades.
+-- Крупные рыночные заявки (>= $100k: все исполнения с одним временем и стороной; price - средняя по $).
 CREATE TABLE IF NOT EXISTS big_trades (
     ts        timestamptz      NOT NULL,
     exchange  text             NOT NULL,
