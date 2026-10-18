@@ -74,6 +74,72 @@ GROUP BY 1, 2
 ORDER BY 2
 """.strip().replace("STEP", STEP)
 
+# Тепловая карта стакана (ob-6). Ячейка = отрезок времени x уровень цены, значение - сколько $ в среднем
+# стояло в заявках на уровне (сумма по выбранным стаканам, обе стороны). Размеры ячейки подбираются под окно:
+#   по времени ~180 столбцов (не меньше минуты), по цене ~120 строк в диапазоне свечей с запасом
+#   max(30% диапазона, 0.25% цены) сверху и снизу. Те же правила продублированы в heatmap_panel.js (запас).
+# Среднее за минуту: сумма avg_usd делится на число минут со снимками в отрезке (минута без строки
+# на уровне = там стояло меньше порога хранения, считаем нулём).
+HEAT_SPAN = """span AS (
+  SELECT (SELECT min(s) FROM unnest(ARRAY[60, 120, 300, 600, 900, 1800, 3600, 7200, 14400, 28800, 86400]) s
+          WHERE s >= ($__unixEpochTo() - $__unixEpochFrom()) / 180.0) AS sec
+)"""
+CANDLE_SRC = """symbol = '$symbol'
+  AND exchange = CASE WHEN '$exchange' = 'all' THEN 'binance' ELSE '$exchange' END
+  AND market = CASE WHEN '$exchange' = 'coinbase' THEN 'spot'
+                    WHEN '$market' = 'all' THEN 'perp' ELSE '$market' END"""
+BOOK_SRC = """symbol = '$symbol'
+  AND ('$market' = 'all' OR market = '$market')
+  AND ('$exchange' = 'all' OR exchange = '$exchange')"""
+BIN = "date_bin(make_interval(secs => span.sec), ts, TIMESTAMPTZ '2001-01-01')"
+
+SQL_HEAT = f"""
+WITH {HEAT_SPAN},
+px AS (
+  SELECT min(low) AS lo, max(high) AS hi FROM ohlc_1m WHERE $__timeFilter(ts) AND {CANDLE_SRC}
+),
+box AS (
+  SELECT lo - pad AS y0, hi + pad AS y1,
+         coalesce((SELECT min(s) FROM unnest(CASE WHEN '$symbol' = 'BTC'
+                                                  THEN ARRAY[10, 20, 25, 50, 100, 250, 500, 1000]
+                                                  ELSE ARRAY[1, 2, 5, 10, 25, 50, 100] END) s
+                   WHERE s >= (hi - lo + 2 * pad) / 120),
+                  CASE WHEN '$symbol' = 'BTC' THEN 1000 ELSE 100 END) AS step
+  FROM (SELECT lo, hi, greatest((hi - lo) * 0.3, hi * 0.0025) AS pad FROM px) q
+),
+mins AS (
+  SELECT {BIN} AS t, count(DISTINCT ts) AS n
+  FROM book_meta_1m, span
+  WHERE $__timeFilter(ts) AND {BOOK_SRC}
+  GROUP BY 1
+),
+cells AS (
+  SELECT {BIN} AS t, floor(price / box.step) * box.step AS level, sum(avg_usd) AS usd
+  FROM book_1m, span, box
+  WHERE $__timeFilter(ts) AND {BOOK_SRC}
+    AND price >= box.y0 - box.step AND price < box.y1 + box.step
+  GROUP BY 1, 2
+)
+SELECT c.t AS time, c.level, c.usd / m.n AS usd,
+       (SELECT step FROM box) AS step, (SELECT sec FROM span) AS sec
+FROM cells c JOIN mins m ON m.t = c.t
+ORDER BY 1, 2
+""".strip()
+
+# Линия цены для тепловой карты: закрытие каждого отрезка (источник тот же, что у свечей footprint).
+SQL_HEAT_PRICE = f"""
+WITH {HEAT_SPAN}
+SELECT {BIN} AS time,
+  (array_agg(close ORDER BY close_ts DESC))[1]       AS close,
+  max(high)                                          AS high,
+  min(low)                                           AS low,
+  max(span.sec)                                      AS sec
+FROM ohlc_1m, span
+WHERE $__timeFilter(ts) AND {CANDLE_SRC}
+GROUP BY 1
+ORDER BY 1
+""".strip()
+
 # Пульс: сколько секунд назад была последняя сделка по каждому потоку.
 SQL_PULSE = """
 SELECT exchange AS "биржа", market AS "рынок", symbol AS "монета",
@@ -101,6 +167,7 @@ def target(ref, sql):
 
 
 code = (HERE / "footprint_panel.js").read_text(encoding="utf-8")
+heat_code = (HERE / "heatmap_panel.js").read_text(encoding="utf-8")
 
 dashboard = {
     "uid": "footprint",
@@ -126,7 +193,7 @@ dashboard = {
     "panels": [
         {
             "id": 1, "type": "volkovlabs-echarts-panel", "datasource": DS,
-            "title": "$symbol · footprint · Sell | Buy | Delta (в монетах), свечи: Binance perp для «все» · справа: крупные заявки стакана сейчас",
+            "title": "$symbol · footprint · Sell | Buy | Delta (в монетах), свечи: Binance perp для «все» · справа: стакан сейчас (Binance, Bybit, OKX)",
             "gridPos": {"h": 27, "w": 24, "x": 0, "y": 0},
             "targets": [target("A", SQL_CLUSTERS), target("B", SQL_CANDLES), target("C", SQL_BOOK)],
             "options": {
@@ -140,8 +207,23 @@ dashboard = {
             },
         },
         {
+            "id": 3, "type": "volkovlabs-echarts-panel", "datasource": DS,
+            "title": "$symbol · тепловая карта стакана: сколько $ стояло в заявках на уровне цены (шкала цвета справа вверху), жёлтая линия - цена",
+            "gridPos": {"h": 20, "w": 24, "x": 0, "y": 27},
+            "targets": [target("H", SQL_HEAT), target("L", SQL_HEAT_PRICE)],
+            "options": {
+                "renderer": "canvas",
+                "editorMode": "code",
+                "getOption": heat_code,
+                "editor": {"format": "auto", "height": 600},
+                "followTheme": False,
+                "themeEditor": {"name": "default", "config": "{}"},
+                "map": "none",
+            },
+        },
+        {
             "id": 2, "type": "table", "datasource": DS, "title": "Пульс потоков",
-            "gridPos": {"h": 9, "w": 24, "x": 0, "y": 27},
+            "gridPos": {"h": 9, "w": 24, "x": 0, "y": 47},
             "targets": [target("A", SQL_PULSE)],
             "fieldConfig": {
                 "defaults": {"custom": {"align": "left"}},
