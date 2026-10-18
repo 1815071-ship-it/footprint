@@ -162,6 +162,11 @@ class Agg:
         self.cells = new_cells()
         self.ohlc = {}          # (минута, биржа, рынок, монета) -> [open_ts, open, high, low, close_ts, close]
         self.big = []
+        # (биржа, рынок, монета) -> [время ms, сторона, монет, $, номер первой сделки]: исполнения одной рыночной
+        # заявки. Крупная сделка = рыночная заявка целиком: все исполнения с одним временем и стороной. Bybit и
+        # Coinbase присылают каждое исполнение отдельно (заявка на $500k по 10 продавцам = 10 сделок по $50k),
+        # Binance aggTrade и OKX склеивают только внутри одного уровня цены.
+        self.taker = {}
         self.hb = {}            # (биржа, рынок, монета) -> [последняя сделка ms, сделок всего]
         self.minute_trades = collections.Counter()
         self.started = datetime.now(timezone.utc)
@@ -200,13 +205,31 @@ class Agg:
             cell[3] += 1
         order = trade_order(ts, tid)
         merge_ohlc(self.ohlc, (minute, exchange, market, sym), [order, price, price, price, order, price])
-        usd = price * qty
-        if usd >= BIG_USD:
-            self.big.append((utc(ts), exchange, market, sym, side, price, qty, usd, tid))
+        k = (exchange, market, sym)
+        g = self.taker.get(k)
+        if g is not None and g[0] == ts and g[1] == side:
+            g[2] += qty
+            g[3] += price * qty
+        else:
+            if g is not None:
+                self.close_taker(k, g)
+            self.taker[k] = [ts, side, qty, price * qty, tid]
         hb = self.hb.setdefault((exchange, market, sym), [0, 0])
         hb[0] = max(hb[0], ts)
         hb[1] += 1
         self.minute_trades[(exchange, market, sym)] += 1
+
+    def close_taker(self, k, g):
+        ts, side, qty, usd, tid = g
+        if usd >= BIG_USD:
+            self.big.append((utc(ts), k[0], k[1], k[2], side, usd / qty, qty, usd, tid))  # цена - средняя по $
+
+    def flush_takers(self, before_ms):
+        """Закрыть заявки, после которых по потоку давно не было сделок (иначе ждали бы следующую сделку)."""
+        for k, g in list(self.taker.items()):
+            if g[0] < before_ms:
+                self.close_taker(k, g)
+                del self.taker[k]
 
     def merge_back(self, cells, big, ohlc):
         """Если запись в базу не удалась, возвращаем данные в накопитель."""
@@ -274,9 +297,11 @@ async def stream(ex, lock, cls, replica, exchange, market, sym, csym, agg):
             agg.add(exchange, market, sym, int(ts), float(price), float(amount) * contract_size, side, tid)
 
 
-async def flush(pool, agg):
+async def flush(pool, agg, final=False):
     cells, agg.cells = agg.cells, new_cells()
     ohlc, agg.ohlc = agg.ohlc, {}
+    # открытые рыночные заявки: обычно ждём 2 с (вдруг придут ещё исполнения), при остановке закрываем все
+    agg.flush_takers(float("inf") if final else int(time.time() * 1000) - 2000)
     big, agg.big = agg.big, []
     hb = [(e, m, s, utc(v[0]), v[1], agg.started) for (e, m, s), v in agg.hb.items()]
     if not cells and not big and not hb:
@@ -439,7 +464,7 @@ async def main():
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
-    await flush(pool, agg)
+    await flush(pool, agg, final=True)
     for copies in exchanges.values():
         for ex in copies:
             try:
