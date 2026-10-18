@@ -37,7 +37,7 @@ services:
       REPLICAS: "2"
     depends_on:
       db: {condition: service_healthy}
-    mem_limit: 768m
+    mem_limit: 1g             # 17.10 в 23:02 упёрлись в 768m и перезапустились; следим за RSS в строке stats
     logging: *logs
 
   # Стакан: снимки книги заявок Binance, Bybit, OKX раз в 15 с (REST, глубже вебсокета).
