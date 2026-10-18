@@ -93,9 +93,8 @@ BOOK_SRC = """symbol = '$symbol'
   AND ('$exchange' = 'all' OR exchange = '$exchange')"""
 BIN = "date_bin(make_interval(secs => span.sec), ts, TIMESTAMPTZ '2001-01-01')"
 
-SQL_HEAT = f"""
-WITH {HEAT_SPAN},
-px AS (
+# Диапазон и шаг строк карты: общий для ячеек стакана (H) и крупных сделок (T).
+HEAT_BOX = f"""px AS (
   SELECT min(low) AS lo, max(high) AS hi FROM ohlc_1m WHERE $__timeFilter(ts) AND {CANDLE_SRC}
 ),
 box AS (
@@ -106,7 +105,11 @@ box AS (
                    WHERE s >= (hi - lo + 2 * pad) / 120),
                   CASE WHEN '$symbol' = 'BTC' THEN 1000 ELSE 100 END) AS step
   FROM (SELECT lo, hi, greatest((hi - lo) * 0.3, hi * 0.0025) AS pad FROM px) q
-),
+)"""
+
+SQL_HEAT = f"""
+WITH {HEAT_SPAN},
+{HEAT_BOX},
 mins AS (
   SELECT {BIN} AS t, count(DISTINCT ts) AS n
   FROM book_meta_1m, span
@@ -137,6 +140,27 @@ SELECT {BIN} AS time,
 FROM ohlc_1m, span
 WHERE $__timeFilter(ts) AND {CANDLE_SRC}
 GROUP BY 1
+ORDER BY 1
+""".strip()
+
+# Крупные сделки поверх карты (tr-1). Берём из big_trades рыночные заявки от $big (переменная дашборда;
+# сборщик пишет туда заявки от $100k, заявка = все исполнения с одним временем и стороной - с 18.10, раньше
+# Bybit и Coinbase писали каждое исполнение отдельно), складываем по ячейке карты (отрезок времени x строка
+# цены) и стороне агрессора: сумма $, число заявок, средняя цена (взвешенная по $), с каких бирж.
+SQL_HEAT_TRADES = f"""
+WITH {HEAT_SPAN},
+{HEAT_BOX}
+SELECT {BIN}                                         AS time,
+  CASE WHEN side = 'buy' THEN 1 ELSE 0 END           AS buy,
+  sum(usd * price) / sum(usd)                        AS price,
+  sum(usd)                                           AS usd,
+  count(*)                                           AS n,
+  string_agg(DISTINCT exchange || ' ' || market, ', ') AS src
+FROM big_trades, span, box
+WHERE $__timeFilter(ts) AND {BOOK_SRC}
+  AND usd >= $big
+  AND price >= box.y0 AND price < box.y1
+GROUP BY 1, 2, floor(price / box.step)
 ORDER BY 1
 """.strip()
 
@@ -189,6 +213,8 @@ dashboard = {
                                        ("1h", "1 hour"), ("4h", "4 hours")], "15 minutes"),
         custom_var("step", "Шаг цены, $", [("авто", "auto")] + [(s, s) for s in ("1", "2", "5", "10", "25", "50", "100",
                                                                                "250", "500")], "auto"),
+        custom_var("big", "Сделки от, $", [("100k", "100000"), ("250k", "250000"), ("500k", "500000"),
+                                           ("1M", "1000000"), ("5M", "5000000")], "500000"),
     ]},
     "panels": [
         {
@@ -208,9 +234,9 @@ dashboard = {
         },
         {
             "id": 3, "type": "volkovlabs-echarts-panel", "datasource": DS,
-            "title": "$symbol · тепловая карта стакана: сколько $ стояло в заявках на уровне цены (шкала цвета справа вверху), жёлтая линия - цена",
+            "title": "$symbol · тепловая карта стакана (сколько $ стояло в заявках, шкала справа вверху), жёлтая линия - цена, кружки - рыночные заявки от $${big:text}: зелёные покупки, красные продажи, площадь - сумма",
             "gridPos": {"h": 20, "w": 24, "x": 0, "y": 27},
-            "targets": [target("H", SQL_HEAT), target("L", SQL_HEAT_PRICE)],
+            "targets": [target("H", SQL_HEAT), target("L", SQL_HEAT_PRICE), target("T", SQL_HEAT_TRADES)],
             "options": {
                 "renderer": "canvas",
                 "editorMode": "code",

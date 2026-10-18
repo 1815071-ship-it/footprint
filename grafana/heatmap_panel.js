@@ -6,6 +6,10 @@
 //       в заявках на уровне за минуту, сумма по выбранным стаканам и обеим сторонам), step ($ на уровень),
 //       sec (ширина отрезка, секунд) - step и sec одинаковые во всех строках
 //   L - цена: time, close, high, low по тем же отрезкам (Binance perp для «все»)
+//   T - крупные рыночные заявки (tr-1): time (отрезок), buy (1 - покупки, 0 - продажи), price (средняя цена,
+//       взвешенная по $), usd (сумма), n (число заявок), src (биржи) - по ячейке карты и стороне
+// Как читать вместе: красные кружки бьют в яркую полосу покупателей, а цена стоит - стену поглощают;
+// полоса пропала до подхода цены, а сделок на ней не было - заявку сняли (спуфинг).
 // Цвет - один оттенок синего: тёмный = мало, светлый = много (в светлой теме наоборот). Шкала - корень
 // от доли от 99-го перцентиля: крупные стены не сжимают остальное в одну краску; всё выше перцентиля - самый
 // яркий цвет. Длинная яркая полоса - заявка, которая долго стояла на одном уровне.
@@ -18,6 +22,9 @@ const dark = theme.isDark;
 const MUTED = theme.colors.text.secondary;
 const GRID = dark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)';
 const PRICE = dark ? '#ffd60a' : '#b08000';
+const BUY = dark ? '#3ddc84' : '#188038';
+const SELL = dark ? '#ff5c5c' : '#d93025';
+const RING = dark ? '#111217' : '#ffffff';   // обводка кружков цветом фона: отделяет их от карты и друг от друга
 // синяя шкала (шаги 700 -> 100): от фона к яркому в тёмной теме, в светлой - наоборот
 const BLUE = ['#0d366b', '#104281', '#184f95', '#1c5cab', '#256abf', '#2a78d6', '#3987e5', '#5598e7', '#6da7ec',
   '#86b6ef', '#9ec5f4', '#b7d3f6', '#cde2fb'];
@@ -40,6 +47,9 @@ const ht = col(H, 'time'), hl = col(H, 'level'), hu = col(H, 'usd');
 const step = Number(col(H, 'step')[0]) || (sym === 'BTC' ? 10 : 1);
 const secMs = (Number(col(H, 'sec')[0] || col(L, 'sec')[0]) || 60) * 1000;
 const lt = col(L, 'time'), lc = col(L, 'close'), lh = col(L, 'high'), ll = col(L, 'low');
+const T = frame('T');
+const tt = col(T, 'time'), tb = col(T, 'buy'), tp = col(T, 'price'), tu = col(T, 'usd'), tn = col(T, 'n'),
+  ts = col(T, 'src');
 
 // Масштаб цвета: 99-й перцентиль ячеек.
 const sorted = hu.filter((x) => x > 0).sort((a, b) => a - b);
@@ -58,6 +68,13 @@ const times = ht.concat(lt);
 const xMin = times.length ? Math.min(...times) : Date.now() - 3 * 3600e3;
 const xMax = times.length ? Math.max(...times) + secMs : Date.now();
 const priceLine = lt.map((t, i) => [t + secMs / 2, lc[i]]);
+
+// Крупные сделки: площадь кружка пропорциональна сумме, самый крупный в окне - 28 px в диаметре.
+// Продажи чуть левее середины отрезка, покупки чуть правее: в одной ячейке не закрывают друг друга.
+const umax = tu.length ? Math.max(...tu) : 1;
+const bubble = (usd) => 5 + 23 * Math.sqrt(usd / umax);
+const trades = (side) => tt.map((t, i) => [t + secMs * (side ? 0.62 : 0.38), tp[i], tu[i], tn[i], ts[i], tb[i]])
+  .filter((d) => d[5] === side);
 
 const pad2 = (x) => String(x).padStart(2, '0');
 const hhmm = (ms) => {
@@ -112,6 +129,16 @@ const heatSeries = {
   },
 };
 
+const tradeSeries = (side) => ({
+  type: 'scatter',
+  name: side ? 'buys' : 'sells',
+  data: trades(side),
+  symbolSize: (d) => bubble(d[2]),
+  itemStyle: { color: side ? BUY : SELL, opacity: 0.9, borderColor: RING, borderWidth: 1.5 },
+  emphasis: { scale: 1.2 },
+  z: 6,
+});
+
 const priceSeries = {
   type: 'line',
   name: 'price',
@@ -152,8 +179,15 @@ return {
     trigger: 'item',
     confine: true,
     formatter: (p) => {
-      if (p.seriesName !== 'heat') return '';
       const d = p.data;
+      if (p.seriesName === 'buys' || p.seriesName === 'sells') {
+        const t0 = d[0] - secMs * (d[5] ? 0.62 : 0.38);
+        return `${tLabel(t0)}–${hhmm(t0 + secMs)} UTC<br/>` +
+          `<b style="color:${d[5] ? BUY : SELL}">${d[5] ? 'Покупки' : 'Продажи'} по рынку ${fmtUsd(d[2])}</b>` +
+          ` · ${d[3]} ${d[3] % 10 === 1 && d[3] % 100 !== 11 ? 'заявка' : (d[3] % 10 >= 2 && d[3] % 10 <= 4 && (d[3] % 100 < 10 || d[3] % 100 >= 20) ? 'заявки' : 'заявок')}<br/>` +
+          `средняя цена $${Math.round(d[1] * 100) / 100}<br/>${d[4]}`;
+      }
+      if (p.seriesName !== 'heat') return '';
       return `${tLabel(d[0])}–${hhmm(d[0] + secMs)} UTC · $${d[1]}–${d[1] + step}<br/>` +
         `<b>${fmtUsd(d[2])}</b> в заявках (в среднем за минуту)`;
     },
@@ -183,5 +217,5 @@ return {
     { type: 'inside', yAxisIndex: 0, filterMode: 'none', zoomOnMouseWheel: 'shift', moveOnMouseMove: 'shift' },
   ],
   graphic: legend,
-  series: [heatSeries, priceSeries],
+  series: [heatSeries, priceSeries, tradeSeries(0), tradeSeries(1)],
 };
