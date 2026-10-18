@@ -49,7 +49,7 @@ services:
       PG_DSN: postgresql://fp:${PG_PASSWORD}@db:5432/footprint
       BOOK_SEC: "15"            # снимок каждого стакана раз в N секунд
       BOOK_RANGE_PCT: "3"       # уровни в пределах ±3% от цены
-      BOOK_KEEP_DAYS: "7"       # хранить 7 дней, старое удаляется раз в час
+      BOOK_KEEP_DAYS: "60"      # хранить 60 дней (~250 МБ/сутки, ~15 ГБ; диск 38 ГБ), старое удаляется раз в час
     depends_on:
       db: {condition: service_healthy}
     mem_limit: 160m
