@@ -244,7 +244,7 @@
         "type": "grafana-postgresql-datasource",
         "uid": "footprint"
       },
-      "title": "$symbol · footprint · Sell | Buy | Delta (в монетах), свечи: Binance perp для «все» · справа: крупные заявки стакана сейчас",
+      "title": "$symbol · footprint · Sell | Buy | Delta (в монетах), свечи: Binance perp для «все» · справа: стакан сейчас (Binance, Bybit, OKX)",
       "gridPos": {
         "h": 27,
         "w": 24,
@@ -303,6 +303,60 @@
       }
     },
     {
+      "id": 3,
+      "type": "volkovlabs-echarts-panel",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "footprint"
+      },
+      "title": "$symbol · тепловая карта стакана: сколько $ стояло в заявках на уровне цены (шкала цвета справа вверху), жёлтая линия - цена",
+      "gridPos": {
+        "h": 20,
+        "w": 24,
+        "x": 0,
+        "y": 27
+      },
+      "targets": [
+        {
+          "refId": "H",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "footprint"
+          },
+          "rawQuery": true,
+          "editorMode": "code",
+          "format": "table",
+          "rawSql": "WITH span AS (\n  SELECT (SELECT min(s) FROM unnest(ARRAY[60, 120, 300, 600, 900, 1800, 3600, 7200, 14400, 28800, 86400]) s\n          WHERE s >= ($__unixEpochTo() - $__unixEpochFrom()) / 180.0) AS sec\n),\npx AS (\n  SELECT min(low) AS lo, max(high) AS hi FROM ohlc_1m WHERE $__timeFilter(ts) AND symbol = '$symbol'\n  AND exchange = CASE WHEN '$exchange' = 'all' THEN 'binance' ELSE '$exchange' END\n  AND market = CASE WHEN '$exchange' = 'coinbase' THEN 'spot'\n                    WHEN '$market' = 'all' THEN 'perp' ELSE '$market' END\n),\nbox AS (\n  SELECT lo - pad AS y0, hi + pad AS y1,\n         coalesce((SELECT min(s) FROM unnest(CASE WHEN '$symbol' = 'BTC'\n                                                  THEN ARRAY[10, 20, 25, 50, 100, 250, 500, 1000]\n                                                  ELSE ARRAY[1, 2, 5, 10, 25, 50, 100] END) s\n                   WHERE s >= (hi - lo + 2 * pad) / 120),\n                  CASE WHEN '$symbol' = 'BTC' THEN 1000 ELSE 100 END) AS step\n  FROM (SELECT lo, hi, greatest((hi - lo) * 0.3, hi * 0.0025) AS pad FROM px) q\n),\nmins AS (\n  SELECT date_bin(make_interval(secs => span.sec), ts, TIMESTAMPTZ '2001-01-01') AS t, count(DISTINCT ts) AS n\n  FROM book_meta_1m, span\n  WHERE $__timeFilter(ts) AND symbol = '$symbol'\n  AND ('$market' = 'all' OR market = '$market')\n  AND ('$exchange' = 'all' OR exchange = '$exchange')\n  GROUP BY 1\n),\ncells AS (\n  SELECT date_bin(make_interval(secs => span.sec), ts, TIMESTAMPTZ '2001-01-01') AS t, floor(price / box.step) * box.step AS level, sum(avg_usd) AS usd\n  FROM book_1m, span, box\n  WHERE $__timeFilter(ts) AND symbol = '$symbol'\n  AND ('$market' = 'all' OR market = '$market')\n  AND ('$exchange' = 'all' OR exchange = '$exchange')\n    AND price >= box.y0 - box.step AND price < box.y1 + box.step\n  GROUP BY 1, 2\n)\nSELECT c.t AS time, c.level, c.usd / m.n AS usd,\n       (SELECT step FROM box) AS step, (SELECT sec FROM span) AS sec\nFROM cells c JOIN mins m ON m.t = c.t\nORDER BY 1, 2"
+        },
+        {
+          "refId": "L",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "footprint"
+          },
+          "rawQuery": true,
+          "editorMode": "code",
+          "format": "table",
+          "rawSql": "WITH span AS (\n  SELECT (SELECT min(s) FROM unnest(ARRAY[60, 120, 300, 600, 900, 1800, 3600, 7200, 14400, 28800, 86400]) s\n          WHERE s >= ($__unixEpochTo() - $__unixEpochFrom()) / 180.0) AS sec\n)\nSELECT date_bin(make_interval(secs => span.sec), ts, TIMESTAMPTZ '2001-01-01') AS time,\n  (array_agg(close ORDER BY close_ts DESC))[1]       AS close,\n  max(high)                                          AS high,\n  min(low)                                           AS low,\n  max(span.sec)                                      AS sec\nFROM ohlc_1m, span\nWHERE $__timeFilter(ts) AND symbol = '$symbol'\n  AND exchange = CASE WHEN '$exchange' = 'all' THEN 'binance' ELSE '$exchange' END\n  AND market = CASE WHEN '$exchange' = 'coinbase' THEN 'spot'\n                    WHEN '$market' = 'all' THEN 'perp' ELSE '$market' END\nGROUP BY 1\nORDER BY 1"
+        }
+      ],
+      "options": {
+        "renderer": "canvas",
+        "editorMode": "code",
+        "getOption": "// Тепловая карта стакана для панели Business Charts (Apache ECharts) в Grafana.\n// Исходник; в дашборд попадает через build_dashboard.py (поле options.getOption).\n//\n// Данные:\n//   H - ячейки: time (начало отрезка), level (нижняя граница уровня), usd (сколько $ в среднем стояло\n//       в заявках на уровне за минуту, сумма по выбранным стаканам и обеим сторонам), step ($ на уровень),\n//       sec (ширина отрезка, секунд) - step и sec одинаковые во всех строках\n//   L - цена: time, close, high, low по тем же отрезкам (Binance perp для «все»)\n// Цвет - один оттенок синего: тёмный = мало, светлый = много (в светлой теме наоборот). Шкала - корень\n// от доли от 99-го перцентиля: крупные стены не сжимают остальное в одну краску; всё выше перцентиля - самый\n// яркий цвет. Длинная яркая полоса - заявка, которая долго стояла на одном уровне.\n// Оговорка: глубина стаканов разная (BTC: Binance perp и Bybit spot ±0.15%, Bybit perp ±0.24%, OKX perp ±0.85%,\n// Binance spot ±1.05%, OKX spot ±1.2% от цены), поэтому у цены складываются все 6 стаканов, а дальше - только\n// глубокие. Яркая полоса вдоль цены отчасти из-за этого; стены дальше ±0.25% - это OKX и Binance spot.\n\nconst theme = context.grafana.theme;\nconst dark = theme.isDark;\nconst MUTED = theme.colors.text.secondary;\nconst GRID = dark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)';\nconst PRICE = dark ? '#ffd60a' : '#b08000';\n// синяя шкала (шаги 700 -> 100): от фона к яркому в тёмной теме, в светлой - наоборот\nconst BLUE = ['#0d366b', '#104281', '#184f95', '#1c5cab', '#256abf', '#2a78d6', '#3987e5', '#5598e7', '#6da7ec',\n  '#86b6ef', '#9ec5f4', '#b7d3f6', '#cde2fb'];\nconst RAMP = dark ? BLUE : BLUE.slice().reverse();\nconst NB = RAMP.length;\n\nconst v = (name) => context.grafana.replaceVariables(name);\nconst sym = v('$symbol');\nconst exch = v('$exchange');\nconst frames = context.panel.data.series || [];\nconst frame = (ref) => frames.find((f) => f.refId === ref);\nconst col = (f, name) => {\n  const fld = f && f.fields.find((x) => x.name === name);\n  return fld ? Array.from(fld.values) : [];\n};\n\nconst H = frame('H');\nconst L = frame('L');\nconst ht = col(H, 'time'), hl = col(H, 'level'), hu = col(H, 'usd');\nconst step = Number(col(H, 'step')[0]) || (sym === 'BTC' ? 10 : 1);\nconst secMs = (Number(col(H, 'sec')[0] || col(L, 'sec')[0]) || 60) * 1000;\nconst lt = col(L, 'time'), lc = col(L, 'close'), lh = col(L, 'high'), ll = col(L, 'low');\n\n// Масштаб цвета: 99-й перцентиль ячеек.\nconst sorted = hu.filter((x) => x > 0).sort((a, b) => a - b);\nconst vmax = sorted.length ? sorted[Math.floor((sorted.length - 1) * 0.99)] : 1;\nconst binOf = (usd) => Math.min(NB - 1, Math.floor(Math.sqrt(Math.min(1, usd / vmax)) * NB));\nconst cells = ht.map((t, i) => [t, hl[i], hu[i], binOf(hu[i])]);\n\n// Шкала цены: диапазон свечей с запасом (как в SQL, build_dashboard.py SQL_HEAT).\nconst lo = ll.length ? Math.min(...ll) : (hl.length ? Math.min(...hl) : 0);\nconst hi = lh.length ? Math.max(...lh) : (hl.length ? Math.max(...hl) + step : 1);\nconst pad = Math.max((hi - lo) * 0.3, hi * 0.0025);\nconst yMin = Math.floor((lo - pad) / step) * step;\nconst yMax = Math.ceil((hi + pad) / step) * step;\n\nconst times = ht.concat(lt);\nconst xMin = times.length ? Math.min(...times) : Date.now() - 3 * 3600e3;\nconst xMax = times.length ? Math.max(...times) + secMs : Date.now();\nconst priceLine = lt.map((t, i) => [t + secMs / 2, lc[i]]);\n\nconst pad2 = (x) => String(x).padStart(2, '0');\nconst hhmm = (ms) => {\n  const d = new Date(ms);\n  return `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}`;\n};\nconst longSpan = xMax - xMin > 26 * 3600e3;\nconst tLabel = (ms) => {\n  const d = new Date(ms);\n  return longSpan ? `${pad2(d.getUTCDate())}.${pad2(d.getUTCMonth() + 1)} ${hhmm(ms)}` : hhmm(ms);\n};\nconst fmtUsd = (x) => (x >= 1e6 ? '$' + (x / 1e6).toFixed(1) + 'M' : '$' + Math.round(x / 1e3) + 'k');\n\n// Окно просмотра: при обновлении сохраняем масштаб; если смотрели правый край - едем за ним.\nconst chart = context.panel.chart || null;\nconst key = [sym, v('$market'), exch].join('|');\nlet startValue = xMin, endValue = xMax;\nconst prev = chart && chart.__heat;\nif (prev && prev.key === key && chart.getOption) {\n  const z = ((chart.getOption() || {}).dataZoom || [])[0];\n  if (z && z.startValue != null && z.endValue != null && (z.startValue > prev.xMin || z.endValue < prev.xMax)) {\n    const width = z.endValue - z.startValue;\n    if (z.endValue >= prev.xMax - secMs / 2) {\n      endValue = xMax;\n      startValue = Math.max(xMin, xMax - width);\n    } else {\n      startValue = z.startValue;\n      endValue = z.endValue;\n    }\n  }\n}\nif (chart) chart.__heat = { key, xMin, xMax };\n\nconst heatSeries = {\n  type: 'custom',\n  name: 'heat',\n  data: cells,\n  encode: { x: 0, y: 1 },\n  clip: true,\n  progressive: 0,\n  renderItem: (params, api) => {\n    const t = api.value(0), level = api.value(1), bin = api.value(3);\n    // углы ячейки округляем до пикселя: соседние ячейки стыкуются без светлых швов\n    const a = api.coord([t, level + step]);\n    const b = api.coord([t + secMs, level]);\n    const x0 = Math.round(a[0]), y0 = Math.round(a[1]);\n    return {\n      type: 'rect',\n      shape: { x: x0, y: y0, width: Math.max(Math.round(b[0]) - x0, 1), height: Math.max(Math.round(b[1]) - y0, 1) },\n      style: { fill: RAMP[bin] },\n    };\n  },\n};\n\nconst priceSeries = {\n  type: 'line',\n  name: 'price',\n  data: priceLine,\n  showSymbol: false,\n  symbol: 'none',\n  lineStyle: { color: PRICE, width: 1.5 },\n  z: 5,\n  silent: true,\n};\n\n// Легенда цвета: полоска из шагов шкалы и подписи «0» и «≥ 99-й перцентиль».\nconst LEG_W = 10, LEG_H = 8;\nconst legend = [];\nif (cells.length) {\n  RAMP.forEach((c, i) => legend.push({\n    type: 'rect', right: 72 + 60 + (NB - 1 - i) * LEG_W, top: 6, z: 6,\n    shape: { width: LEG_W, height: LEG_H }, style: { fill: c },\n  }));\n  legend.push({ type: 'text', right: 72 + 64 + NB * LEG_W, top: 4, z: 6,\n    style: { text: '$0', fill: MUTED, font: '11px sans-serif' } });\n  legend.push({ type: 'text', right: 72, top: 4, z: 6,\n    style: { text: '≥ ' + fmtUsd(vmax), fill: MUTED, font: '11px sans-serif' } });\n} else {\n  legend.push({ type: 'text', left: 'center', top: 'middle', z: 6,\n    style: {\n      text: exch === 'coinbase' ? 'Стакан Coinbase не собираем' : 'Нет снимков стакана за этот период',\n      fill: MUTED, font: '13px sans-serif',\n    } });\n}\n\nreturn {\n  backgroundColor: 'transparent',\n  animation: false,\n  // фон области графика - нижний цвет шкалы: уровень без строки в базе = там стояло меньше порога хранения\n  grid: { left: 8, right: 72, top: 22, bottom: 46, show: true, backgroundColor: RAMP[0], borderWidth: 0 },\n  tooltip: {\n    trigger: 'item',\n    confine: true,\n    formatter: (p) => {\n      if (p.seriesName !== 'heat') return '';\n      const d = p.data;\n      return `${tLabel(d[0])}–${hhmm(d[0] + secMs)} UTC · $${d[1]}–${d[1] + step}<br/>` +\n        `<b>${fmtUsd(d[2])}</b> в заявках (в среднем за минуту)`;\n    },\n  },\n  xAxis: {\n    type: 'time',\n    min: xMin,\n    max: xMax,\n    axisLine: { lineStyle: { color: GRID } },\n    splitLine: { show: false },\n    axisLabel: { color: MUTED, formatter: (x) => tLabel(x), hideOverlap: true },\n  },\n  yAxis: {\n    type: 'value',\n    position: 'right',\n    min: yMin,\n    max: yMax,\n    splitLine: { show: true, lineStyle: { color: GRID } },\n    axisLabel: { color: MUTED, formatter: (x) => '$' + x },\n  },\n  dataZoom: [\n    { type: 'inside', xAxisIndex: 0, filterMode: 'weakFilter', startValue, endValue },\n    {\n      type: 'slider', xAxisIndex: 0, filterMode: 'weakFilter', startValue, endValue, height: 14, bottom: 6,\n      showDetail: false, borderColor: GRID, textStyle: { color: MUTED },\n    },\n    { type: 'inside', yAxisIndex: 0, filterMode: 'none', zoomOnMouseWheel: 'shift', moveOnMouseMove: 'shift' },\n  ],\n  graphic: legend,\n  series: [heatSeries, priceSeries],\n};\n",
+        "editor": {
+          "format": "auto",
+          "height": 600
+        },
+        "followTheme": false,
+        "themeEditor": {
+          "name": "default",
+          "config": "{}"
+        },
+        "map": "none"
+      }
+    },
+    {
       "id": 2,
       "type": "table",
       "datasource": {
@@ -314,7 +368,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 27
+        "y": 47
       },
       "targets": [
         {
