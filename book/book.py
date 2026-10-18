@@ -4,6 +4,8 @@
 у BTC всего ±0.06-0.26% от цены (замер 17.10.2026). Крупные заявки, ради которых всё затевается, стоят дальше.
 REST отдаёт глубже: Binance spot до 5000 уровней, OKX books-full 5000 (BTC ±1%, ETH ±2-3%), Bybit perp 1000.
 Цена решения: снимок раз в BOOK_SEC секунд (15), заявку, которая прожила меньше, можем не увидеть.
+Исключение - Binance perp (ob-8): REST там отдаёт максимум 1000 уровней (у BTC ±0.15%), поэтому держим свой
+стакан из вебсокета изменений (см. LocalBook), а REST остаётся запасным путём, пока свой стакан не собран.
 
 Снимок раскладывается по уровням цены (BTC $10, ETH $1, как в fp_1m) в пределах ±BOOK_RANGE_PCT от середины.
 Уровни копятся по минутам: средний, максимальный и последний объём заявок на уровне, в долларах.
@@ -25,6 +27,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
+import aiohttp
 import asyncpg
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -161,6 +164,167 @@ def parse(exchange, market, sym, j):
     return levels(d["bids"], mult), levels(d["asks"], mult)
 
 
+# ---------- Binance perp: свой стакан из вебсокета (ob-8) ----------
+# Поток изменений стакана (depth diff) присылает каждое изменение любого уровня с новым объёмом (0 - уровень
+# пуст). Свой стакан = снимок REST (1000 уровней) + все изменения после него, по правилам Binance
+# («How to manage a local order book correctly», USDⓈ-M futures):
+#   события копим; берём снимок; выбрасываем события с u < lastUpdateId; первое применяемое должно иметь
+#   U <= lastUpdateId <= u; дальше у каждого события pu должен совпадать с u предыдущего, иначе цепочка
+#   порвалась - собираем стакан заново.
+# Ограничение: уровень дальше 1000-го, который не менялся с момента сборки, мы не знаем, он появится при
+# первом изменении. Новые и переставленные стены видны сразу; после перезапуска дальняя часть заполняется
+# постепенно.
+FWS_URL = os.getenv("BINANCE_FWS", "wss://fstream.binance.com/stream")
+FAPI_URL = os.getenv("BINANCE_FAPI", "https://fapi.binance.com")
+LOCAL_SILENT_SEC = 30.0     # нет сообщений столько секунд - переподключаемся
+LOCAL_KEEP_PCT = 10.0       # уровни дальше ±10% от цены выбрасываем, чтобы стакан не рос бесконечно
+LOCAL_MAX_BUFFER = 3000     # событий в очереди, пока ждём снимок
+
+
+class LocalBook:
+    def __init__(self, sym):
+        self.sym = sym
+        self.bids, self.asks = {}, {}
+        self.synced = False
+        self.last_u = None
+        self.buffer = []
+        self.resyncs = 0          # сколько раз собирали заново (за период статистики)
+        self.snap_at = 0.0        # monotonic последнего запроса снимка
+        self.pending = None       # снимок, для которого ещё не пришли события новее
+
+    def reset(self):
+        self.bids, self.asks = {}, {}
+        self.synced = False
+        self.last_u = None
+        self.buffer = []
+        self.pending = None
+
+    def _apply(self, ev):
+        for side, rows in ((self.bids, ev["b"]), (self.asks, ev["a"])):
+            for p, q in rows:
+                p, q = float(p), float(q)
+                if q == 0:
+                    side.pop(p, None)
+                else:
+                    side[p] = q
+        self.last_u = ev["u"]
+
+    def on_event(self, ev):
+        """Событие из потока. False - цепочка порвалась, стакан надо собирать заново."""
+        if not self.synced:
+            self.buffer.append(ev)
+            if len(self.buffer) > LOCAL_MAX_BUFFER:
+                self.buffer = self.buffer[-LOCAL_MAX_BUFFER // 2:]
+            return True
+        if ev["pu"] != self.last_u:
+            return False
+        self._apply(ev)
+        return True
+
+    def load_snapshot(self, snap):
+        """Снимок REST + накопленные события -> "ok" (стакан собран), "wait" (событий новее снимка ещё нет,
+        снимок держим и ждём), "stale" (снимок старше первого события - нужен новый)."""
+        lid = snap["lastUpdateId"]
+        events = [e for e in self.buffer if e["u"] >= lid]
+        if not events:
+            return "wait"
+        if events[0]["U"] > lid:
+            return "stale"
+        self.bids = {float(p): float(q) for p, q in snap["bids"] if float(q) > 0}
+        self.asks = {float(p): float(q) for p, q in snap["asks"] if float(q) > 0}
+        self.last_u = None
+        for e in events:
+            if self.last_u is not None and e["pu"] != self.last_u:
+                self.reset()
+                return "stale"
+            self._apply(e)
+        self.buffer = []
+        self.synced = True
+        return "ok"
+
+    def levels(self):
+        """(заявки на покупку, на продажу) как [(цена, монет)]; заодно чистим уровни дальше ±LOCAL_KEEP_PCT."""
+        if not self.bids or not self.asks:
+            return [], []
+        mid = (max(self.bids) + min(self.asks)) / 2
+        lo, hi = mid * (1 - LOCAL_KEEP_PCT / 100), mid * (1 + LOCAL_KEEP_PCT / 100)
+        self.bids = {p: q for p, q in self.bids.items() if p >= lo}
+        self.asks = {p: q for p, q in self.asks.items() if p <= hi}
+        return list(self.bids.items()), list(self.asks.items())
+
+
+async def local_sync(books, stop):
+    """Собирает стаканы, которые ещё не собраны: ждёт первых событий, берёт снимок REST, сверяет номера."""
+    while not stop.is_set():
+        for sym, b in books.items():
+            if b.synced or not b.buffer:
+                continue
+            if b.pending is None or time.monotonic() - b.snap_at > 10:   # снимок не подошёл за 10 с - берём новый
+                if time.monotonic() - b.snap_at < 2:
+                    continue
+                b.snap_at = time.monotonic()
+                url = f"{FAPI_URL}/fapi/v1/depth?symbol={sym}USDT&limit=1000"
+                try:
+                    b.pending, _ = await asyncio.wait_for(asyncio.to_thread(http_json, url), HTTP_TIMEOUT + 5)
+                except Exception as e:  # noqa: BLE001
+                    b.pending = None
+                    log.warning("binance perp %s: снимок для своего стакана не получен: %s", sym, str(e)[:120])
+                    continue
+            res = b.load_snapshot(b.pending)
+            if res == "ok":
+                b.pending = None
+                b.resyncs += 1
+                log.info("binance perp %s: свой стакан собран (%d/%d уровней)", sym, len(b.bids), len(b.asks))
+            elif res == "stale":
+                b.pending = None
+        await sleep_or_stop(stop, 0.5)
+
+
+async def local_books_ws(st, stop):
+    """Поток изменений стакана Binance perp -> st.local (монета -> LocalBook). Падает - переподключаемся."""
+    syms = [s for (e, m, s) in STREAMS if e == "binance" and m == "perp"]
+    for s in syms:
+        st.local[s] = LocalBook(s)
+    url = FWS_URL + "?streams=" + "/".join(f"{s.lower()}usdt@depth@500ms" for s in syms)
+    delay = 1
+    while not stop.is_set():
+        for b in st.local.values():
+            b.reset()
+        sync = None
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.ws_connect(url, heartbeat=60, max_msg_size=0) as ws:
+                    log.info("binance perp: вебсокет стакана подключён (%s)", ", ".join(syms))
+                    sync = asyncio.create_task(local_sync(st.local, stop))
+                    while not stop.is_set():
+                        msg = await asyncio.wait_for(ws.receive(), LOCAL_SILENT_SEC)
+                        if msg.type != aiohttp.WSMsgType.TEXT:
+                            if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED,
+                                            aiohttp.WSMsgType.ERROR):
+                                raise ConnectionError(f"ws {msg.type.name}")
+                            continue
+                        data = json.loads(msg.data)
+                        ev = data.get("data", data)
+                        if ev.get("e") != "depthUpdate":
+                            continue
+                        b = st.local.get(ev["s"][:-4])
+                        if b is not None and not b.on_event(ev):
+                            log.warning("binance perp %s: пропуск в потоке (pu %s, ждали %s), собираю заново",
+                                        b.sym, ev["pu"], b.last_u)
+                            b.reset()
+                            b.on_event(ev)
+                        delay = 1
+        except asyncio.TimeoutError:
+            log.warning("binance perp: вебсокет молчит %ds, переподключаюсь", LOCAL_SILENT_SEC)
+        except Exception as e:  # noqa: BLE001
+            log.warning("binance perp: вебсокет стакана: %s", str(e)[:200] or type(e).__name__)
+        finally:
+            if sync is not None:
+                sync.cancel()
+        await sleep_or_stop(stop, delay)
+        delay = min(delay * 2, 60)
+
+
 # ---------- уровни ----------
 
 class Snap:
@@ -264,6 +428,8 @@ class State:
         self.last_err = {}
         self.blocked_until = {}                        # биржа -> monotonic: пауза после 429/418
         self.binance_weight = (0, 0.0)                 # (вес за минуту, monotonic когда узнали)
+        self.local = {}                                # монета -> LocalBook (Binance perp)
+        self.from_ws = collections.Counter()           # снимков, взятых из своего стакана
 
 
 async def save(pool, st, key, aggs):
@@ -296,6 +462,17 @@ async def save(pool, st, key, aggs):
 
 async def snap_one(pool, st, key):
     exchange, market, sym = key
+    lb = st.local.get(sym) if (exchange, market) == ("binance", "perp") else None
+    if lb is not None and lb.synced:
+        bids, asks = lb.levels()
+        snap = bucketize(bids, asks, sym, 10**9)   # свой стакан не обрезан: видимость ±BOOK_RANGE_PCT
+        if snap is None:                            # пусто или перекрещено - что-то разошлось, собираем заново
+            log.warning("binance perp %s: свой стакан перекрещен или пуст, собираю заново", sym)
+            lb.reset()
+        else:
+            st.from_ws[key] += 1
+            await add_snap(pool, st, key, snap)
+            return
     if exchange == "binance" and market == "spot":
         w, at = st.binance_weight
         if w > BINANCE_WEIGHT_MAX and time.monotonic() - at < 60:
@@ -323,12 +500,17 @@ async def snap_one(pool, st, key):
     # вес считаем только по spot: у фьючерсов Binance свой счётчик и свой лимит
     if exchange == "binance" and market == "spot" and headers.get("x-mbx-used-weight-1m", "").isdigit():
         st.binance_weight = (int(headers["x-mbx-used-weight-1m"]), time.monotonic())
-    now = time.time()
     snap = bucketize(bids, asks, sym, LIMIT[(exchange, market)])
     if snap is None:
         st.fail[key] += 1
         st.last_err[key] = "пустой или перекрещенный стакан"
         return
+    await add_snap(pool, st, key, snap)
+
+
+async def add_snap(pool, st, key, snap):
+    exchange, market, sym = key
+    now = time.time()
     st.ok[key] += 1
     minute = int(now // 60 * 60)
     cur = st.minutes.get(key)
@@ -399,13 +581,19 @@ async def stats(st, stop):
                 cov = f" -{(1 - cur.last.floor / mid) * 100:.2f}%+{(cur.last.ceil / mid - 1) * 100:.2f}%"
             bad = f" fail={st.fail[key]}" if st.fail[key] else ""
             skip = f" skip={st.skipped[key]}" if st.skipped[key] else ""
-            parts.append(f"{key[0]}/{key[1]}/{key[2]}={st.ok[key]}{bad}{skip}{cov}")
+            ws = ""
+            if key in [("binance", "perp", s) for s in st.local]:
+                lbk = st.local[key[2]]
+                ws = f" ws={st.from_ws[key]} lv={len(lbk.bids)}/{len(lbk.asks)} resync={lbk.resyncs}"
+                lbk.resyncs = 0
+            parts.append(f"{key[0]}/{key[1]}/{key[2]}={st.ok[key]}{bad}{skip}{cov}{ws}")
         log.info("stats: snaps/min %s; rows written %d; binance weight %d; peak RSS %d MB",
                  " ".join(parts), sum(st.rows.values()), st.binance_weight[0], rss)
         errs = {k: v for k, v in st.last_err.items() if st.fail[k]}
         if errs:
             log.warning("errors: %s", "; ".join(f"{k[0]} {k[1]} {k[2]}: {v}" for k, v in errs.items()))
         st.ok.clear()
+        st.from_ws.clear()
         st.fail.clear()
         st.skipped.clear()
         st.rows.clear()
@@ -451,6 +639,8 @@ async def main():
              "min level $%d BTC / $%d ETH", len(STREAMS), BOOK_SEC, RANGE_PCT, KEEP_DAYS, MIN_USD["BTC"], MIN_USD["ETH"])
     tasks = [asyncio.create_task(poll_exchange(pool, st, ex, stop)) for ex in ("binance", "bybit", "okx")]
     tasks += [asyncio.create_task(stats(st, stop)), asyncio.create_task(cleaner(pool, stop))]
+    if os.getenv("BINANCE_PERP_WS", "1") == "1":
+        tasks.append(asyncio.create_task(local_books_ws(st, stop)))
     await stop.wait()
     log.info("stopping")
     await asyncio.gather(*tasks, return_exceptions=True)
