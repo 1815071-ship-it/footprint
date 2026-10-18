@@ -1,12 +1,16 @@
 // Footprint-кластеры для панели Business Charts (Apache ECharts) в Grafana.
 // Этот файл - исходник. В дашборд он попадает через build_dashboard.py (поле options.getOption).
 //
-// Данные приходят двумя запросами:
+// Данные приходят тремя запросами:
 //   A - кластеры: time (начало бара), level (нижняя граница уровня цены), sell, buy (объём в монетах)
 //   B - свечи:    time, open, high, low, close
+//   C - стакан сейчас: ask (1 - заявки на продажу, 0 - на покупку), level, usd (сумма заявок на уровне, $),
+//       snap (время последнего снимка, одинаковое во всех строках)
 // На каждый бар рисуем слот: свеча слева, дальше три колонки по уровням цены:
 //   Sell (агрессивные продажи) | Buy (агрессивные покупки) | Delta = Buy - Sell с полосой.
 // Рамкой выделен уровень с максимальным объёмом в баре (POC).
+// Справа от графика, на той же шкале цены, - крупные заявки стакана в последнем снимке (как в CoinGlass):
+// красные полосы продавцов, зелёные - покупателей, длина полосы - сумма заявок на уровне.
 
 const theme = context.grafana.theme;
 const dark = theme.isDark;
@@ -18,10 +22,16 @@ const GREEN = dark ? '#3ddc84' : '#188038';
 const RED_BAR = dark ? 'rgba(255,92,92,0.55)' : 'rgba(217,48,37,0.45)';
 const GREEN_BAR = dark ? 'rgba(61,220,132,0.55)' : 'rgba(24,128,56,0.45)';
 const POC = dark ? 'rgba(255,214,10,0.9)' : 'rgba(176,128,0,0.9)';
+const ASK_BAR = dark ? 'rgba(255,92,92,0.75)' : 'rgba(217,48,37,0.7)';
+const BID_BAR = dark ? 'rgba(61,220,132,0.75)' : 'rgba(24,128,56,0.7)';
 
 const v = (name) => context.grafana.replaceVariables(name);
-const step = Number(v('$step')) || 50;
 const sym = v('$symbol');
+// «авто»: та же таблица, что в SQL (build_dashboard.py, STEP) - менять вместе
+const autoStep = (s, tf) => (s === 'BTC'
+  ? ({ '1 hour': 25, '4 hours': 100 }[tf] || 10)
+  : ({ '1 hour': 2, '4 hours': 5 }[tf] || 1));
+const step = v('$step') === 'auto' ? autoStep(sym, v('$tf')) : (Number(v('$step')) || 50);
 const frames = context.panel.data.series || [];
 const frame = (ref) => frames.find((f) => f.refId === ref);
 const col = (f, name) => {
@@ -33,6 +43,8 @@ const A = frame('A');
 const B = frame('B');
 const at = col(A, 'time'), lv = col(A, 'level'), sl = col(A, 'sell'), by = col(A, 'buy');
 const bt = col(B, 'time'), bo = col(B, 'open'), bh = col(B, 'high'), bl = col(B, 'low'), bc = col(B, 'close');
+const C = frame('C');
+const ca = col(C, 'ask'), cl = col(C, 'level'), cu = col(C, 'usd');
 
 // Слоты = бары по времени. Слот i занимает по оси X отрезок [i, i+1).
 const times = Array.from(new Set([...at, ...bt])).sort((a, b) => a - b);
@@ -68,6 +80,17 @@ for (let i = 0; i < at.length; i++) {
   }
 }
 const candles = bt.map((t, i) => [slotOf.get(t), bo[i], bh[i], bl[i], bc[i]]);
+
+// Стакан: [0, null, уровень, $, ask, обе стороны]. Ось Y привязана к пустому измерению 1, чтобы стакан
+// (он шире по цене, чем свечи) не растягивал шкалу: шкала по-прежнему подстраивается под видимые бары.
+// Длина полосы - доля от самого крупного уровня в видимой части шкалы. Если на уровне есть и покупатели,
+// и продавцы (цены на биржах чуть расходятся), уровень делится пополам: сверху продавцы, снизу покупатели.
+const sides = new Map();
+cl.forEach((l, i) => sides.set(l, (sides.get(l) || 0) | (ca[i] ? 2 : 1)));
+const book = cl.map((l, i) => [0, null, l, cu[i] || 0, ca[i] ? 1 : 0, sides.get(l) === 3 ? 1 : 0]);
+const snapMs = col(C, 'snap')[0];
+const BOOKW = book.length ? 150 : 0;   // ширина колонки стакана, px
+const fmtUsd = (x) => (x >= 1e6 ? '$' + (x / 1e6).toFixed(1) + 'M' : '$' + Math.round(x / 1e3) + 'k');
 
 // Окно просмотра: при обновлении данных сохраняем масштаб; если смотрели последние бары - едем за ними.
 const chart = context.panel.chart || null;
@@ -139,6 +162,58 @@ const clusterSeries = {
   },
 };
 
+// Колонка стакана рисуется справа от области графика, между свечами и шкалой цены.
+// Своя скрытая ось X (xAxisIndex 1), чтобы прокрутка по времени её не фильтровала; ось Y общая.
+const bookSeries = {
+  type: 'custom',
+  name: 'book',
+  xAxisIndex: 1,
+  data: book,
+  encode: { x: 0, y: 1 },
+  clip: false,
+  z: 4,
+  renderItem: (params, api) => {
+    const cs = params.coordSys;
+    const ctx = params.context;
+    if (ctx.vmax == null) {
+      // видимый диапазон цен: переводим края области графика из пикселей в цену (шкала линейная)
+      const ya = api.coord([0, 0])[1], yb = api.coord([0, 100000])[1];
+      const price = (y) => ((y - ya) * 100000) / (yb - ya);
+      const lo = price(cs.y + cs.height), hi = price(cs.y);
+      ctx.vmax = 0;
+      for (const b of book) if (b[2] + step > lo && b[2] < hi) ctx.vmax = Math.max(ctx.vmax, b[3]);
+    }
+    const level = api.value(2), usd = api.value(3), ask = api.value(4), both = api.value(5);
+    let top = api.coord([0, level + step])[1];
+    let bot = api.coord([0, level])[1];
+    if (both) {
+      const mid = (top + bot) / 2;
+      if (ask) bot = mid; else top = mid;
+    }
+    if (bot < cs.y || top > cs.y + cs.height) return null;   // уровень вне видимой шкалы цены
+    const y0 = Math.max(top, cs.y), y1 = Math.min(bot, cs.y + cs.height);
+    const h = y1 - y0;
+    const x0 = cs.x + cs.width + 6;
+    const maxW = BOOKW - 52;
+    const w = Math.max(1, (usd / (ctx.vmax || 1)) * maxW);
+    const kids = [{
+      type: 'rect',
+      shape: { x: x0, y: y0 + (h > 3 ? 0.5 : 0), width: w, height: Math.max(h - (h > 3 ? 1 : 0), 1) },
+      style: { fill: ask ? ASK_BAR : BID_BAR },
+    }];
+    if (h >= 9) {
+      kids.push({
+        type: 'text',
+        style: {
+          x: x0 + w + 4, y: y0 + h / 2, text: fmtUsd(usd), fill: MUTED, align: 'left', verticalAlign: 'middle',
+          font: `${Math.max(8, Math.min(11, Math.floor(h * 0.75)))}px sans-serif`,
+        },
+      });
+    }
+    return { type: 'group', children: kids };
+  },
+};
+
 const candleSeries = {
   type: 'custom',
   name: 'candles',
@@ -171,12 +246,15 @@ const candleSeries = {
 return {
   backgroundColor: 'transparent',
   animation: false,
-  grid: { left: 8, right: 72, top: 10, bottom: 46 },
+  grid: { left: 8, right: 72 + BOOKW, top: BOOKW ? 24 : 10, bottom: 46 },
   tooltip: {
     trigger: 'item',
     confine: true,
     formatter: (p) => {
       const d = p.data;
+      if (p.seriesName === 'book') {
+        return `${d[4] ? 'Продают' : 'Покупают'} $${d[2]}–${d[2] + step}<br/><b>${fmtUsd(d[3])}</b> в заявках сейчас`;
+      }
       const when = label(times[d[0]]);
       if (p.seriesName === 'candles') {
         return `${when} UTC<br/>open ${d[1]}<br/>high ${d[2]}<br/>low ${d[3]}<br/>close ${d[4]}`;
@@ -187,7 +265,7 @@ return {
         `<b>Delta ${fmt(d[4])} ${sym}</b>`;
     },
   },
-  xAxis: {
+  xAxis: [{
     type: 'value',
     min: 0,
     max: n,
@@ -196,10 +274,11 @@ return {
     axisTick: { show: false },
     splitLine: { show: true, lineStyle: { color: GRID } },
     axisLabel: { color: MUTED, formatter: (x) => (Number.isInteger(x) && x < n ? label(times[x]) : '') },
-  },
+  }, { type: 'value', show: false, min: 0, max: 1 }],
   yAxis: {
     type: 'value',
     position: 'right',
+    offset: BOOKW,
     scale: true,
     max: (e) => Math.ceil(e.max / step) * step + step,
     min: (e) => Math.floor(e.min / step) * step,
@@ -214,5 +293,12 @@ return {
     },
     { type: 'inside', yAxisIndex: 0, filterMode: 'none', zoomOnMouseWheel: 'shift', moveOnMouseMove: 'shift' },
   ],
-  series: [clusterSeries, candleSeries],
+  graphic: BOOKW ? [{
+    type: 'text', right: 72 + 8, top: 4, z: 5,
+    style: {
+      text: snapMs ? `стакан на ${label(snapMs)}:${pad(new Date(snapMs).getUTCSeconds())} UTC` : 'стакан сейчас',
+      fill: MUTED, font: '11px sans-serif', align: 'right',
+    },
+  }] : [],
+  series: [clusterSeries, candleSeries, bookSeries],
 };

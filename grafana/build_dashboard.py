@@ -9,11 +9,18 @@ import pathlib
 HERE = pathlib.Path(__file__).parent
 DS = {"type": "grafana-postgresql-datasource", "uid": "footprint"}
 
-# A: кластеры. Минутные ячейки fp_1m склеиваем в бары таймфрейма ($tf) и уровни шага ($step).
+# Шаг цены. «авто» зависит от монеты и таймфрейма (минимум - шаг хранения: BTC $10, ETH $1).
+# Та же таблица продублирована в footprint_panel.js (autoStep) - менять вместе.
+# NULLIF, а не CASE ... ELSE '$step'::numeric: литерал 'auto'::numeric Postgres разбирает ещё до выполнения и падает.
+STEP = """coalesce(nullif('$step', 'auto')::numeric,
+    CASE WHEN '$symbol' = 'BTC' THEN (CASE '$tf' WHEN '1 hour' THEN 25 WHEN '4 hours' THEN 100 ELSE 10 END)
+         ELSE (CASE '$tf' WHEN '1 hour' THEN 2 WHEN '4 hours' THEN 5 ELSE 1 END) END)"""
+
+# A: кластеры. Минутные ячейки fp_1m склеиваем в бары таймфрейма ($tf) и уровни шага.
 SQL_CLUSTERS = """
 SELECT
   date_bin('$tf'::interval, ts, TIMESTAMPTZ '2001-01-01') AS time,
-  floor(price / $step) * $step                       AS level,
+  floor(price / STEP) * STEP                         AS level,
   sum(sell_vol)                                      AS sell,
   sum(buy_vol)                                       AS buy
 FROM fp_1m
@@ -23,7 +30,7 @@ WHERE $__timeFilter(ts)
   AND ('$exchange' = 'all' OR exchange = '$exchange')
 GROUP BY 1, 2
 ORDER BY 1, 2
-""".strip()
+""".strip().replace("STEP", STEP)
 
 # B: свечи. Для «все биржи» берём свечи Binance; для «spot + perp» - перп; у Coinbase только spot.
 SQL_CANDLES = """
@@ -42,6 +49,30 @@ WHERE $__timeFilter(ts)
 GROUP BY 1
 ORDER BY 1
 """.strip()
+
+# C: стакан сейчас. Последний снимок каждого потока (не старше 5 минут), заявки сложены по уровням шага.
+# В book_1m лежат только уровни, где стояло от $50k (BTC) / $20k (ETH); last_usd - объём в последнем снимке минуты.
+# Coinbase стакан не собираем: при выборе Coinbase панель стакана пустая.
+SQL_BOOK = """
+WITH latest AS (
+  SELECT exchange, market, max(ts) AS ts, max(last_snap) AS snap
+  FROM book_meta_1m
+  WHERE symbol = '$symbol' AND ts > now() - interval '5 minutes'
+    AND ('$market' = 'all' OR market = '$market')
+    AND ('$exchange' = 'all' OR exchange = '$exchange')
+  GROUP BY 1, 2
+)
+SELECT
+  CASE WHEN b.side = 'ask' THEN 1 ELSE 0 END         AS ask,
+  floor(b.price / STEP) * STEP                       AS level,
+  sum(b.last_usd)                                    AS usd,
+  max(max(l.snap)) OVER ()                           AS snap
+FROM book_1m b
+JOIN latest l ON l.exchange = b.exchange AND l.market = b.market AND l.ts = b.ts
+WHERE b.symbol = '$symbol' AND b.last_usd > 0
+GROUP BY 1, 2
+ORDER BY 2
+""".strip().replace("STEP", STEP)
 
 # Пульс: сколько секунд назад была последняя сделка по каждому потоку.
 SQL_PULSE = """
@@ -89,14 +120,15 @@ dashboard = {
                                           ("OKX", "okx"), ("Coinbase", "coinbase")], "all"),
         custom_var("tf", "Таймфрейм", [("1m", "1 minute"), ("5m", "5 minutes"), ("15m", "15 minutes"),
                                        ("1h", "1 hour"), ("4h", "4 hours")], "15 minutes"),
-        custom_var("step", "Шаг цены, $", [(s, s) for s in ("1", "2", "5", "10", "25", "50", "100", "250", "500")], "50"),
+        custom_var("step", "Шаг цены, $", [("авто", "auto")] + [(s, s) for s in ("1", "2", "5", "10", "25", "50", "100",
+                                                                               "250", "500")], "auto"),
     ]},
     "panels": [
         {
             "id": 1, "type": "volkovlabs-echarts-panel", "datasource": DS,
-            "title": "$symbol · footprint · Sell | Buy | Delta (в монетах), свечи: Binance perp для «все»",
+            "title": "$symbol · footprint · Sell | Buy | Delta (в монетах), свечи: Binance perp для «все» · справа: крупные заявки стакана сейчас",
             "gridPos": {"h": 27, "w": 24, "x": 0, "y": 0},
-            "targets": [target("A", SQL_CLUSTERS), target("B", SQL_CANDLES)],
+            "targets": [target("A", SQL_CLUSTERS), target("B", SQL_CANDLES), target("C", SQL_BOOK)],
             "options": {
                 "renderer": "canvas",
                 "editorMode": "code",
