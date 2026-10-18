@@ -22,6 +22,20 @@ import asyncpg
 import ccxt.pro as ccxtpro
 from ccxt.base.errors import NetworkError
 
+# Обход ошибки ccxt 4.5.84 + aiohttp 3.14 (главная причина «молча замолкающих» вебсокетов 17.10).
+# ccxt в receive_loop забирает накопившиеся сообщения прямо из внутренней очереди aiohttp, минуя её учёт
+# размера, и не вычитает служебные 128 байт на каждое такое сообщение. Счётчик размера очереди только растёт;
+# примерно через 4000 сообщений, пришедших пачками, он упирается в лимит (512 КБ), aiohttp ставит соединение
+# на паузу и больше не снимает её: биржа шлёт, а мы не читаем. Чем активнее рынок, тем быстрее.
+# Воспроизведено локально настоящими ccxt 4.5.84 + aiohttp 3.14.5: без обхода поток встаёт после ~4500
+# сообщений, с обходом доходят все 30000. Отключаем этот путь - сообщения читаются штатно, учёт верный.
+try:
+    from ccxt.async_support.base.ws.client import Client as _WsClient
+    _WsClient.buffer = property(lambda self: None)
+    WS_DRAIN_PATCHED = True
+except Exception:  # noqa: BLE001  (другая версия ccxt без этого места)
+    WS_DRAIN_PATCHED = False
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("fp")
 
@@ -297,17 +311,27 @@ async def flusher(pool, agg, stop):
         written += await flush(pool, agg)
         if time.monotonic() - last_stats >= STATS_SEC:
             rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+            rss_now = current_rss_mb()
             per = " ".join(f"{e}/{m}/{s}={n}" for (e, m, s), n in sorted(agg.minute_trades.items()))
             resets = " ".join(f"{c}#{r}={n}" for (c, r), n in sorted(agg.resets.items())) or "0"
             dark = " ".join(f"{e}/{m}/{s}={n}" for (e, m, s), n in sorted(agg.blackouts.items())) or "0"
             # доля сделок, пришедших повторно по второй копии: ~100% значит, что обе копии живы
             dup = " ".join(f"{e}/{m}/{s}={agg.dupes[(e, m, s)] * 100 // max(n, 1)}%"
                            for (e, m, s), n in sorted(agg.minute_trades.items()))
-            log.info("stats: rows written %d, peak RSS %d MB, watchdog resets: %s, all copies silent: %s, "
-                     "trades/min: %s, dup%%: %s", written, rss, resets, dark, per or "none", dup or "none")
+            log.info("stats: rows written %d, RSS %d MB (peak %d), watchdog resets: %s, all copies silent: %s, "
+                     "trades/min: %s, dup%%: %s", written, rss_now, rss, resets, dark, per or "none", dup or "none")
             agg.minute_trades.clear()
             agg.dupes.clear()
             written, last_stats = 0, time.monotonic()
+
+
+def current_rss_mb():
+    """Текущая память процесса (не пиковая): по ней видно, растёт ли она со временем."""
+    try:
+        with open("/proc/self/statm") as f:
+            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") // 2**20
+    except Exception:  # noqa: BLE001
+        return -1
 
 
 def stall_limit(agg, key, elapsed):
@@ -407,7 +431,8 @@ async def main():
                                                         exchange, market, sym, csym, agg)))
     tasks.append(asyncio.create_task(watchdog(exchanges, agg, stop)))
     log.info("collector started: %d streams x %d connection copies, flush every %ss, big trade >= $%d, "
-             "stall limit >= %ds", (len(tasks) - 1) // REPLICAS, REPLICAS, FLUSH_SEC, BIG_USD, STALL_SEC)
+             "stall limit >= %ds, ws drain patch: %s", (len(tasks) - 1) // REPLICAS, REPLICAS, FLUSH_SEC, BIG_USD,
+             STALL_SEC, "on" if WS_DRAIN_PATCHED else "NOT APPLIED")
 
     await flusher(pool, agg, stop)  # работает до SIGTERM
     log.info("stopping: final flush")
