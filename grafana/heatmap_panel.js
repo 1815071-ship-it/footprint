@@ -51,11 +51,60 @@ const T = frame('T');
 const tt = col(T, 'time'), tb = col(T, 'buy'), tp = col(T, 'price'), tu = col(T, 'usd'), tn = col(T, 'n'),
   ts = col(T, 'src');
 
-// Масштаб цвета: 99-й перцентиль ячеек.
+// Два режима цвета (переменная $heat):
+//   rel (по умолчанию) - «стены»: во сколько раз на уровне стоит больше, чем обычно стоит на таком же
+//       расстоянии от цены за всё окно (медиана по всем отрезкам). У цены всегда много заявок (там видны все
+//       6 стаканов), поэтому в объёмах облако у цены забивает всё; в отношении к обычному оно становится ровным
+//       фоном, а стены - и у цены, и вдали - выделяются. Шкала: обычно и меньше - тёмный, x8 и больше - самый яркий.
+//   abs - сам объём $: корень от доли от 99-го перцентиля ячеек.
+const mode = v('$heat') === 'abs' ? 'abs' : 'rel';
+const RATIO_MAX = 8;
+const closeAt = new Map(lt.map((t, i) => [t, lc[i]]));
+let lastClose = lc.length ? lc[0] : null;
+const dist = ht.map((t, i) => {          // расстояние уровня от цены закрытия отрезка, в строках карты
+  const c = closeAt.has(t) ? closeAt.get(t) : lastClose;
+  if (closeAt.has(t)) lastClose = c;
+  return c == null ? 0 : Math.round((hl[i] + step / 2 - c) / step);
+});
+const median = (arr) => {
+  const a = arr.slice().sort((x, y) => x - y);
+  return a.length ? a[Math.floor(a.length / 2)] : 0;
+};
+const byDist = new Map();
+dist.forEach((d, i) => { if (!byDist.has(d)) byDist.set(d, []); byDist.get(d).push(hu[i]); });
+const allMed = median(hu) || 1;
+const baseCache = new Map();
+const baseline = (d) => {                // обычный объём на расстоянии d; мало данных - соседние строки, потом общая
+  if (baseCache.has(d)) return baseCache.get(d);
+  let vals = byDist.get(d) || [];
+  for (let k = 1; vals.length < 20 && k <= 3; k++) vals = vals.concat(byDist.get(d - k) || [], byDist.get(d + k) || []);
+  const b = vals.length >= 10 ? median(vals) : allMed;
+  baseCache.set(d, b || allMed);
+  return b || allMed;
+};
+const ratio = hu.map((u, i) => u / baseline(dist[i]));
+// Стена - это то, что стоит долго. Одиночные вспышки на одну-две минуты (заявку поставили и сняли, или цена
+// пробежала уровень внутри отрезка) гасим: цвет берём по медиане отношения за 5 соседних отрезков на том же
+// уровне (пустой отрезок = 0; у краёв окна - только существующие отрезки).
+const nCols = Math.round((Math.max(...ht, 0) - Math.min(...ht, 0)) / secMs) + 1;
+const t0 = ht.length ? Math.min(...ht) : 0;
+const colOf = (t) => Math.round((t - t0) / secMs);
+const atLevel = new Map();                 // уровень -> Map(отрезок -> отношение)
+ht.forEach((t, i) => {
+  if (!atLevel.has(hl[i])) atLevel.set(hl[i], new Map());
+  atLevel.get(hl[i]).set(colOf(t), ratio[i]);
+});
+const smooth = ht.map((t, i) => {
+  const row = atLevel.get(hl[i]), c = colOf(t), w = [];
+  for (let k = Math.max(0, c - 2); k <= Math.min(nCols - 1, c + 2); k++) w.push(row.get(k) || 0);
+  return median(w);
+});
 const sorted = hu.filter((x) => x > 0).sort((a, b) => a - b);
 const vmax = sorted.length ? sorted[Math.floor((sorted.length - 1) * 0.99)] : 1;
-const binOf = (usd) => Math.min(NB - 1, Math.floor(Math.sqrt(Math.min(1, usd / vmax)) * NB));
-const cells = ht.map((t, i) => [t, hl[i], hu[i], binOf(hu[i])]);
+const binOf = (i) => (mode === 'abs'
+  ? Math.min(NB - 1, Math.floor(Math.sqrt(Math.min(1, hu[i] / vmax)) * NB))
+  : Math.min(NB - 1, Math.max(0, Math.floor((Math.log(Math.max(smooth[i], 1)) / Math.log(RATIO_MAX)) * NB))));
+const cells = ht.map((t, i) => [t, hl[i], hu[i], binOf(i), ratio[i]]);
 
 // Шкала цены: диапазон свечей с запасом (как в SQL, build_dashboard.py SQL_HEAT).
 const lo = ll.length ? Math.min(...ll) : (hl.length ? Math.min(...hl) : 0);
@@ -86,6 +135,7 @@ const tLabel = (ms) => {
   const d = new Date(ms);
   return longSpan ? `${pad2(d.getUTCDate())}.${pad2(d.getUTCMonth() + 1)} ${hhmm(ms)}` : hhmm(ms);
 };
+const fmtX = (r) => (r >= 10 ? Math.round(r) : r.toFixed(1)) + ' раза';
 const fmtUsd = (x) => (x >= 1e6 ? '$' + (x / 1e6).toFixed(1) + 'M' : '$' + Math.round(x / 1e3) + 'k');
 
 // Окно просмотра: при обновлении сохраняем масштаб; если смотрели правый край - едем за ним.
@@ -159,9 +209,10 @@ if (cells.length) {
     shape: { width: LEG_W, height: LEG_H }, style: { fill: c },
   }));
   legend.push({ type: 'text', right: 72 + 64 + NB * LEG_W, top: 4, z: 6,
-    style: { text: '$0', fill: MUTED, font: '11px sans-serif' } });
+    style: { text: mode === 'abs' ? '$0' : 'как обычно', fill: MUTED, font: '11px sans-serif' } });
   legend.push({ type: 'text', right: 72, top: 4, z: 6,
-    style: { text: '≥ ' + fmtUsd(vmax), fill: MUTED, font: '11px sans-serif' } });
+    style: { text: mode === 'abs' ? '≥ ' + fmtUsd(vmax) : '×' + RATIO_MAX + ' и больше', fill: MUTED,
+      font: '11px sans-serif' } });
 } else {
   legend.push({ type: 'text', left: 'center', top: 'middle', z: 6,
     style: {
@@ -189,7 +240,10 @@ return {
       }
       if (p.seriesName !== 'heat') return '';
       return `${tLabel(d[0])}–${hhmm(d[0] + secMs)} UTC · $${d[1]}–${d[1] + step}<br/>` +
-        `<b>${fmtUsd(d[2])}</b> в заявках (в среднем за минуту)`;
+        `<b>${fmtUsd(d[2])}</b> в заявках (в среднем за минуту)<br/>` +
+        (d[4] >= 1.1 ? `в ${fmtX(d[4])} больше обычного на таком расстоянии от цены`
+          : d[4] <= 0.9 ? `в ${fmtX(1 / d[4])} меньше обычного на таком расстоянии от цены`
+            : 'как обычно на таком расстоянии от цены');
     },
   },
   xAxis: {
