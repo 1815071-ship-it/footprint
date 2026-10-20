@@ -10,11 +10,14 @@
 """
 import asyncio
 import collections
+import ctypes
+import gc
 import logging
 import math
 import os
 import resource
 import signal
+import sys
 import time
 from datetime import datetime, timezone
 
@@ -50,6 +53,8 @@ STALL_SEC = float(os.getenv("STALL_SEC", "90"))
 WATCH_SEC = 5.0
 REPLICAS = max(1, int(os.getenv("REPLICAS", "2")))  # сколько независимых копий соединений держать к каждой бирже
 SEEN_MAX = 20000  # сколько последних номеров сделок помнить на поток для отбрасывания повторов
+# Разбор памяти (fp-13: RSS растёт ~4 МБ/ч): раз в MEM_DIAG_SEC секунд строка memdiag в логе. 0 - выключено.
+MEM_DIAG_SEC = float(os.getenv("MEM_DIAG_SEC", "3600"))
 
 # (биржа, рынок, класс ccxt, {монета: символ ccxt})
 VENUES = [
@@ -359,6 +364,74 @@ def current_rss_mb():
         return -1
 
 
+class _MallInfo2(ctypes.Structure):
+    _fields_ = [(n, ctypes.c_size_t) for n in ("arena", "ordblks", "smblks", "hblks", "hblkhd", "usmblks",
+                                               "fsmblks", "uordblks", "fordblks", "keepcost")]
+
+
+def malloc_mb():
+    """Память через malloc (объекты Python крупнее 512 байт, C-библиотеки): (занято, свободно внутри куч, mmap), МБ.
+    Если «занято» стоит, а растёт «свободно» - это не утечка, а фрагментация куч malloc."""
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        libc.mallinfo2.restype = _MallInfo2
+        m = libc.mallinfo2()
+        return m.uordblks >> 20, m.fordblks >> 20, m.hblkhd >> 20
+    except Exception:  # noqa: BLE001
+        return -1, -1, -1
+
+
+def mem_diag(agg, exchanges, prev):
+    """Одна строка разбора памяти. prev - счётчик объектов по типам с прошлого раза (обновляется на месте).
+    Занимает ~1 с (обход всех объектов), поэтому редко."""
+    t0 = time.monotonic()
+    collected = gc.collect()
+    counts = collections.Counter(type(o) for o in gc.get_objects())
+    total, prev_total = sum(counts.values()), sum(prev.values())
+    growth = []
+    if prev:
+        diff = counts.copy()
+        diff.subtract(prev)
+        growth = [f"{t.__module__}.{t.__qualname__} {n:+d}" for t, n in diff.most_common(10) if n > 0]
+    prev.clear()
+    prev.update(counts)
+    used, free, mmap = malloc_mb()
+    own = (f"cells={len(agg.cells)} ohlc={len(agg.ohlc)} big={len(agg.big)} taker={len(agg.taker)} "
+           f"seen={sum(len(q) for q, _ in agg.seen.values())} hb={len(agg.hb)} seen_at={len(agg.seen_at)}")
+    ccxt_parts = []
+    for cls, copies in sorted(exchanges.items()):
+        for r, ex in enumerate(copies):
+            clients = list((getattr(ex, "clients", None) or {}).values())
+            fut = sum(len(getattr(c, "futures", None) or {}) for c in clients)
+            sub = sum(len(getattr(c, "subscriptions", None) or {}) for c in clients)
+            rej = sum(len(getattr(c, "rejections", None) or {}) for c in clients)
+            trades = getattr(ex, "trades", None)
+            tr = sum(len(v) for v in trades.values()) if isinstance(trades, dict) else -1
+            ccxt_parts.append(f"{cls}#{r}=cl{len(clients)}/fut{fut}/sub{sub}/rej{rej}/tr{tr}")
+    log.info("memdiag: RSS %d MB, python blocks %.2fM, malloc used %d MB free %d MB mmap %d MB, "
+             "gc objects %.2fM (%+d), gc collected %d, garbage %d, tasks %d, took %.1fs | own: %s | ccxt: %s | "
+             "grew: %s", current_rss_mb(), sys.getallocatedblocks() / 1e6, used, free, mmap, total / 1e6,
+             total - prev_total if prev_total else 0, collected, len(gc.garbage), len(asyncio.all_tasks()),
+             time.monotonic() - t0, own, " ".join(ccxt_parts), ", ".join(growth) or "first sample")
+
+
+async def mem_diag_loop(agg, exchanges, stop):
+    """Первый разбор через 5 минут после старта (или раньше, если MEM_DIAG_SEC меньше), дальше раз в MEM_DIAG_SEC."""
+    prev = collections.Counter()
+    delay = min(300.0, MEM_DIAG_SEC)
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=delay)
+            return
+        except asyncio.TimeoutError:
+            pass
+        try:
+            mem_diag(agg, exchanges, prev)
+        except Exception as e:  # noqa: BLE001
+            log.warning("memdiag failed: %s", str(e)[:200])
+        delay = MEM_DIAG_SEC
+
+
 def stall_limit(agg, key, elapsed):
     """Сколько секунд тишины терпим для потока: 8 средних интервалов между сделками, от STALL_SEC до 600 с.
     key = (класс ccxt, копия, биржа, рынок, монета)."""
@@ -455,9 +528,11 @@ async def main():
                 tasks.append(asyncio.create_task(stream(exchanges[cls][replica], locks[cls][replica], cls, replica,
                                                         exchange, market, sym, csym, agg)))
     tasks.append(asyncio.create_task(watchdog(exchanges, agg, stop)))
+    if MEM_DIAG_SEC > 0:
+        tasks.append(asyncio.create_task(mem_diag_loop(agg, exchanges, stop)))
     log.info("collector started: %d streams x %d connection copies, flush every %ss, big trade >= $%d, "
-             "stall limit >= %ds, ws drain patch: %s", (len(tasks) - 1) // REPLICAS, REPLICAS, FLUSH_SEC, BIG_USD,
-             STALL_SEC, "on" if WS_DRAIN_PATCHED else "NOT APPLIED")
+             "stall limit >= %ds, ws drain patch: %s, memdiag every %ss", (len(tasks) - 1 - (MEM_DIAG_SEC > 0)) // REPLICAS, REPLICAS, FLUSH_SEC, BIG_USD,
+             STALL_SEC, "on" if WS_DRAIN_PATCHED else "NOT APPLIED", MEM_DIAG_SEC or "off")
 
     await flusher(pool, agg, stop)  # работает до SIGTERM
     log.info("stopping: final flush")
